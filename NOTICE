@@ -1,0 +1,25 @@
+uucli
+Copyright (C) 2026 uucli contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE.
+
+Portions of this program are ported from uu-remote-linux
+(https://github.com/VallierDev/uu-remote-linux), version v0.2.59
+(commit 5f28047a341143a033d98be95b0e8152c3e1464d), licensed under
+GPL-3.0-or-later. The protocol logic in src/api.zig, src/login.zig,
+src/signal.zig, src/rtc.zig, src/session.zig, src/wire.zig and src/tools/
+follows that project's Rust implementation.
+
+uucli is not affiliated with or endorsed by NetEase. "UU Remote" (网易UU远程)
+is a NetEase product.
+
+Third-party components built into uucli:
+- libdatachannel (MPL-2.0) https://github.com/paullouisageneau/libdatachannel
+- libjuice (MPL-2.0) https://github.com/paullouisageneau/libjuice
+- usrsctp (BSD-3-Clause) https://github.com/sctplab/usrsctp
+- plog (MIT) https://github.com/SergiusTheBest/plog
+- Mbed TLS (Apache-2.0) https://github.com/Mbed-TLS/mbedtls
+- Nayuki QR Code generator (MIT) https://github.com/nayuki/QR-Code-generator
