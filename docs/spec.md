@@ -472,7 +472,6 @@ uucli/
 ├── LICENSE  NOTICE
 ├── docs/spec.md
 ├── tests/vectors/         # golden data generated from upstream (§10)
-├── tools/gen-vectors/     # Rust program that produces tests/vectors from upstream v0.2.59
 └── src/
     ├── main.zig           # argument parsing, dispatch, exit codes
     ├── config.zig         # path, permissions, atomic write, flock
@@ -508,13 +507,11 @@ uucli/
 ## 10. Testing
 
 - `zig build test` runs offline and needs no account or device.
-- **Golden vectors**: `tools/gen-vectors` is a small Rust program that compiles upstream code at the
-  pinned commit and writes JSON files to `tests/vectors/`. Upstream is a binary crate with heavy system
-  dependencies, so its `build.rs` copies self-contained modules (`auth.rs`) and extracts single items
-  verbatim from the others (`login.rs`: `qr_poll_action`, `qr_ticket`, `csrf_from_token`, ...) into the
-  generator; it refuses a checkout that is not at the pinned commit
-  (`UPSTREAM_DIR=... cargo run -- ../../tests/vectors`). `zig build test` embeds the files. Vectors are committed; regenerating
-  them is only needed when the upstream pin changes. Required vectors:
+- **Golden vectors**: `tests/vectors/*.json` were computed by upstream's own code at the pinned
+  commit, so they are the authority on exact bytes. `zig build test` embeds the files. The Rust
+  generator that wrote them (`tools/gen-vectors`) was removed after the vectors were committed; it
+  is in git history (commit `aeff338`) if the upstream pin ever moves and the vectors have to be
+  regenerated. The vectors cover:
   - request signing: method, path, header map, body → signature;
   - `build_headers` with and without token;
   - protobuf: varint edge cases, `envelope`, `rpc`, portmap `frame`;
