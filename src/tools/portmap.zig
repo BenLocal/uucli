@@ -292,8 +292,14 @@ pub const PortMap = struct {
 
         const ack = try waitFrame(st, syn_timeout);
         defer pm.gpa.free(ack.data);
-        if (ack.kind != wire.PortFrame.syn_ack) return error.Rejected;
-        if (!synAckOk(ack.data)) return error.Rejected;
+        if (ack.kind != wire.PortFrame.syn_ack or !synAckOk(ack.data)) {
+            // A SYN-ACK carries only status JSON; a CLOSE or other frame is shown by type and size.
+            if (ack.kind == wire.PortFrame.syn_ack)
+                log.info("stream {d}: SYN-ACK {s}", .{ st.id, ack.data[0..@min(ack.data.len, 200)] })
+            else
+                log.info("stream {d}: frame type {d} ({d} bytes) instead of SYN-ACK", .{ st.id, ack.kind, ack.data.len });
+            return error.Rejected;
+        }
         log.debug("stream {d} established", .{st.id});
 
         const U = union(enum) { up: anyerror!void, down: anyerror!void };

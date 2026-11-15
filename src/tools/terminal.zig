@@ -279,7 +279,8 @@ pub const Terminal = struct {
         const body = (try t.request(.{ 24, id }, wire.control, req, .fromSeconds(3))) orelse return;
         defer t.gpa.free(body);
         if (wire.uint(body, 1) != 0) {
-            log.info("check_env: code {d}", .{wire.uint(body, 1)});
+            const message = wire.blob(body, 2) orelse "";
+            log.info("check_env: code {d}: {s}", .{ wire.uint(body, 1), message[0..@min(message.len, 80)] });
             return error.Rejected;
         }
     }
@@ -310,7 +311,10 @@ pub const Terminal = struct {
         defer t.gpa.free(req);
         const body = (try t.request(.{ Kind.open_resp, 0 }, wire.binary, req, .fromSeconds(30))) orelse return error.RemoteTimeout;
         defer t.gpa.free(body);
-        if (codeOf(body) != 0) return error.Rejected;
+        if (codeOf(body) != 0) {
+            log.info("open: code {d}: {s}", .{ codeOf(body), body[0..@min(body.len, 200)] });
+            return error.Rejected;
+        }
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
         // The official Windows host answers without an id and serves session 0.

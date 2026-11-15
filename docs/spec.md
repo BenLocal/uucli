@@ -425,7 +425,8 @@ FRAME = {1: session (varint, always 1), 2: rule_id, 3: stream_id, 4: type, 5: pa
   (upstream drops the route). After SYN-ACK, inbound CLOSE ends the stream, type 4 is ignored and
   any other type than DATA is an error that ends the stream.
 - Per accepted TCP connection: send SYN, wait ≤ 12 s for SYN-ACK; a timeout or rejection closes the
-  local socket (logged at warn, counted). Then copy both ways until either side closes; always send
+  local socket (logged at warn, counted; a rejecting SYN-ACK, which holds only status JSON such as
+  `{"ok":false,"error":"device_not_controllable"}`, is logged at info). Then copy both ways until either side closes; always send
   CLOSE at the end. TCP half-close is not supported (closing one direction closes the stream).
 - Inbound frames with session ≠ 1 or unknown (rule, stream) are dropped (logged at debug, no payload).
 - Max 128 concurrent streams per rule; further connections are accepted and closed immediately.
@@ -538,7 +539,7 @@ uucli/
 
 The wire protocol below was ported from upstream before M2 passed on a real device, so the original
 "after M2" ordering was not kept. It is verified against the in-process fake host (§10) only; the
-real-device checks of §12 are still open for M2–M4.
+real-device checks of §12 are still open for M2–M4 (first results in §12).
 
 ### 11.1 Terminal (M3)
 
@@ -566,11 +567,12 @@ fails the terminal).
 | 11 / 12 KILL_REQ / KILL_RESP | out / in | `{"code":0}` = killed |
 
 - First an environment check: `envelope(id, 21, {1: {1: id}, 28: ""})` on CONTROL (`id` counts from
-  10). The answer `{22: {1: {1: id}, 24: {1: code}}}` comes on CONTROL, or on BINARY without the TERM
-  magic (official Mac host). code ≠ 0 → exit 6. No answer within 3 s means the host does not
+  10). The answer `{22: {1: {1: id}, 24: {1: code, 2: message}}}` comes on CONTROL, or on BINARY
+  without the TERM magic (official Mac host). code ≠ 0 → exit 6, with the code and the first 80 bytes
+  of the message logged at info (seen: code 2 `device_locked` while the Mac's screen is locked). No answer within 3 s means the host does not
   implement the check (official Windows host) and is not an error.
 - Other requests wait up to 30 s (timeout → exit 6). Re-attaching to SESSION first checks it is in
-  LIST_RESP (missing → exit 6). OPEN_RESP code ≠ 0 → exit 6.
+  LIST_RESP (missing → exit 6). OPEN_RESP code ≠ 0 → exit 6; its status JSON is logged at info.
 - STDOUT / EXIT / ERROR for other sessions are ignored. Output is copied to stdout unchanged.
 - Attach: with stdin a tty, enter raw mode, send the initial window size, forward SIGWINCH resizes.
   With stdin not a tty there is no raw mode and no escape processing; stdin is forwarded as-is and
@@ -655,20 +657,33 @@ Mac host compatibility (filled in as milestones complete):
 
 | Milestone | Mac host result | Notes |
 | --- | --- | --- |
-| M2 portmap | untested | |
-| M3 terminal | untested | |
-| M4 files | untested | |
+| M2 portmap | blocked | 2026-11-15: session setup passes (room join, ICE, DTLS, all five data channels, echo). Every SYN is answered `{"ok":false,"error":"device_not_controllable"}`. |
+| M3 terminal | blocked | 2026-11-15: `--list` works (empty list). OPEN is answered `{"code":403,"message":"device_not_controllable"}`; later, with the Mac's screen locked, check_env answers code 2 `device_locked`. |
+| M4 files | blocked | 2026-11-15: `ls` gets no answer within 30 s. |
+
+The 2026-11-15 Mac host was the official UU app on the same Mac that ran uucli. Upstream sends the
+same OPEN and SYN, so `device_not_controllable` is taken to be a host-side state (the host's
+"allow remote control" setting or macOS permissions), not a protocol error. It has to be re-run
+with the host allowing control.
+
+Real-device log:
+
+| Date | Check | Result |
+| --- | --- | --- |
+| 2026-11-15 | M1 QR login | passed; config written with mode 0600; `device list` shows the account's 3 devices and not uucli itself |
+| 2026-11-15 | M1 second login, comparison with `uuyc-cli device list` | not run |
+| 2026-11-15 | Windows host `terminal --list` | room join refused with API 2002 (host controlled from another device); the host then went offline |
 
 ## 13. Open questions and protocol drift
 
 | Question | Closed in | Notes |
 | --- | --- | --- |
-| Does `device/windows/init` add a visible device to the account, and is the name `uucli@HOSTNAME` shown? | M1 | |
-| Do official hosts accept tool sessions with no media sections in the offer? | M2 | Upstream adds media only for desktop (capture_type 1), so expected yes. |
-| Does the official host require a non-empty FeatureFlag (field 11) for tool sessions? | M2 | Upstream clears it for tools and only sends it for desktop. |
+| Does `device/windows/init` add a visible device to the account, and is the name `uucli@HOSTNAME` shown? | M1 | Partly: registration and login succeed; `device list` hides uucli itself, so how it is shown still needs the UU app. |
+| Do official hosts accept tool sessions with no media sections in the offer? | M2 | Yes for the Mac host (2026-11-15): capture types 8 and 9 reach "session ready". |
+| Does the official host require a non-empty FeatureFlag (field 11) for tool sessions? | M2 | Not for session setup on the Mac host (2026-11-15). Whether it is behind `device_not_controllable` is open. |
 | Does the Mac host support capture types 8 / 9 at all? | M2 / M3 | Upstream has not verified it. |
-| Does libdatachannel produce candidates/SDP the host accepts (vs webrtc-rs upstream)? | M2 | Watch `sdpMid`, `ice-options`, DTLS role. |
-| What does the API answer for bad requests? | M1 | Observed: wrong signature → HTTP 400 code 1003; `gen/login` without a registered `x-param-device-id` → HTTP 422 code 1001 ("无效的请求参数"). |
+| Does libdatachannel produce candidates/SDP the host accepts (vs webrtc-rs upstream)? | M2 | Yes for the Mac host (2026-11-15): ICE connects, DTLS completes, all data channels open. |
+| What does the API answer for bad requests? | M1 | Observed: wrong signature → HTTP 400 code 1003; `gen/login` without a registered `x-param-device-id` → HTTP 422 code 1001 ("无效的请求参数"); room join to a host that is being controlled → code 2002. |
 | Which `std.Io` implementation to use with libdatachannel callbacks? | M0 | Closed: `std.Io.Threaded`; foreign-thread `Io.Queue` puts work (loopback self test, 60/60 runs on macOS, Linux x86_64 and aarch64). |
 
 Upstream drift log (append when the pin moves):
