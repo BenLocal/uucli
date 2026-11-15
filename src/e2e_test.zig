@@ -126,6 +126,19 @@ const Host = struct {
         h.queue.putOneUncancelable(h.io, .ws_end) catch {};
     }
 
+    fn drain(h: *Host) void {
+        var buf: [16]HostEvent = undefined;
+        while (true) {
+            const n = h.queue.getUncancelable(h.io, &buf, 0) catch return;
+            if (n == 0) return;
+            for (buf[0..n]) |e| switch (e) {
+                .ws => |m| h.gpa.free(m.data),
+                .rtc => |ev| ev.deinit(),
+                .ws_end => {},
+            };
+        }
+    }
+
     fn sendWs(w: *Io.Writer, text: []const u8) !void {
         try ws.testServerFrame(w, true, .text, text);
         try w.flush();
@@ -156,6 +169,8 @@ const Host = struct {
         try testing.expectEqualStrings("40", hs.data);
         try sendWs(&w.interface, "40{\"sid\":\"c1\"}");
 
+        // Runs last: frees events queued after the loop stopped reading.
+        defer h.drain();
         var reader = try io.concurrent(wsReader, .{ h, &r.interface });
         defer reader.cancel(io);
         defer if (h.peer) |p| p.close();
