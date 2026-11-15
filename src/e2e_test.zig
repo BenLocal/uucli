@@ -731,6 +731,18 @@ fn smallSize() [2]u16 {
     return .{ 100, 30 };
 }
 
+// `Session.open` failing after the session took over its arena (here: Ctrl-C during setup, on a
+// real host also a room the host closes) must free the arena once, not twice.
+test "session open fails cleanly after the session exists" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env: Env = undefined;
+    try env.init(io, gpa);
+    defer env.deinit();
+    env.bus.put(.interrupt);
+    try testing.expectError(error.Interrupted, env.open(9));
+}
+
 test "terminal end to end through a fake host" {
     const io = testing.io;
     const gpa = testing.allocator;

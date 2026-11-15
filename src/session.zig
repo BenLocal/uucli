@@ -198,7 +198,9 @@ pub const Session = struct {
         const io = setup.io;
         const started = Io.Clock.awake.now(io);
         var arena: std.heap.ArenaAllocator = .init(setup.gpa);
-        errdefer arena.deinit();
+        // The session takes the arena by value below; from then on `s.close` frees it.
+        var arena_moved = false;
+        errdefer if (!arena_moved) arena.deinit();
         const room = api.joinRoom(setup.client, arena.allocator(), setup.target) catch |err| return switch (err) {
             error.NotSignedIn => error.NotSignedIn,
             error.DeviceBusy => error.DeviceBusy,
@@ -237,6 +239,7 @@ pub const Session = struct {
             .setup_deadline = started.addDuration(setup_timeout),
             .app_control_id = uuid(io),
         };
+        arena_moved = true;
         errdefer s.close();
         var ice_raw: [16]u8 = undefined;
         io.random(&ice_raw);
