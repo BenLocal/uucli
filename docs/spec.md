@@ -673,16 +673,18 @@ Real-device log:
 | 2026-11-15 | M1 QR login | passed; config written with mode 0600; `device list` shows the account's 3 devices and not uucli itself |
 | 2026-11-15 | M1 second login, comparison with `uuyc-cli device list` | not run |
 | 2026-11-15 | Windows host `terminal --list` | room join refused with API 2002 (host controlled from another device); the host then went offline |
+| 2026-11-15 | Windows host `terminal --list` | passed on retry: session ready (ICE, DTLS, all five data channels, echo); empty list |
+| 2026-11-15 | Windows host `terminal` open | refused: no check_env answer (as expected for Windows), then OPEN answered `{"code":401,"message":"device_not_logged_in"}`. Taken to be a host-side state (UU app not signed in, or no interactive Windows session), not yet confirmed |
 
 ## 13. Open questions and protocol drift
 
 | Question | Closed in | Notes |
 | --- | --- | --- |
 | Does `device/windows/init` add a visible device to the account, and is the name `uucli@HOSTNAME` shown? | M1 | Partly: registration and login succeed; `device list` hides uucli itself, so how it is shown still needs the UU app. |
-| Do official hosts accept tool sessions with no media sections in the offer? | M2 | Yes for the Mac host (2026-11-15): capture types 8 and 9 reach "session ready". |
+| Do official hosts accept tool sessions with no media sections in the offer? | M2 | Yes for the Mac host (2026-11-15): capture types 8 and 9 reach "session ready". Windows host: capture type 9 reaches "session ready" (2026-11-15). |
 | Does the official host require a non-empty FeatureFlag (field 11) for tool sessions? | M2 | Not for session setup on the Mac host (2026-11-15). Whether it is behind `device_not_controllable` is open. |
 | Does the Mac host support capture types 8 / 9 at all? | M2 / M3 | Upstream has not verified it. |
-| Does libdatachannel produce candidates/SDP the host accepts (vs webrtc-rs upstream)? | M2 | Yes for the Mac host (2026-11-15): ICE connects, DTLS completes, all data channels open. |
+| Does libdatachannel produce candidates/SDP the host accepts (vs webrtc-rs upstream)? | M2 | Yes for the Mac and Windows hosts (2026-11-15): ICE connects, DTLS completes, all data channels open. |
 | What does the API answer for bad requests? | M1 | Observed: wrong signature → HTTP 400 code 1003; `gen/login` without a registered `x-param-device-id` → HTTP 422 code 1001 ("无效的请求参数"); room join to a host that is being controlled → code 2002. |
 | Which `std.Io` implementation to use with libdatachannel callbacks? | M0 | Closed: `std.Io.Threaded`; foreign-thread `Io.Queue` puts work (loopback self test, 60/60 runs on macOS, Linux x86_64 and aarch64). |
 
