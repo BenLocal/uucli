@@ -693,7 +693,11 @@ Real-device log:
 | 2026-11-15 | M1 second login, comparison with `uuyc-cli device list` | not run |
 | 2026-11-15 | Windows host `terminal --list` | room join refused with API 2002 (host controlled from another device); the host then went offline |
 | 2026-11-15 | Windows host `terminal --list` | passed on retry: session ready (ICE, DTLS, all five data channels, echo); empty list |
-| 2026-11-15 | Windows host `terminal` open | refused: no check_env answer (as expected for Windows), then OPEN answered `{"code":401,"message":"device_not_logged_in"}`. Taken to be a host-side state (UU app not signed in, or no interactive Windows session), not yet confirmed |
+| 2026-11-15 | Windows host `terminal` open, host locked | refused: no check_env answer (as expected for Windows), then OPEN answered `{"code":401,"message":"device_not_logged_in"}`. Cause: the host's screen was locked. The official `uuyc-cli term -d DEV list` failed at the same time (`Terminal environment check timed out`, code 105) |
+| 2026-11-15 | Windows host unlock from uucli | no answer to either guess: SimpleAction 15 `AUTO_UNLOCK_SYSTEM` with `{"key": …}` on CONTROL (upstream Linux host format), or TERM `UNLOCK_REQ` (14) with `{"password": …}`. How the official Windows host takes the system password is unknown |
+| 2026-11-15 | Windows host `terminal` open, host unlocked, no other controller | passed: OPEN accepted, PowerShell ran a command and printed its output; detach ends the session (one terminal per connection). No password was sent |
+| 2026-11-15 | Windows host `proxy` as ssh `ProxyCommand` to `127.0.0.1:22` | passed up to authentication: SYN-ACK ok, SSH key exchange with the host's OpenSSH sshd completed. Login, `scp` and the reconnect check of M2 not run yet. Before this run, a setup failure (host refusing the control request) panicked with a double free in `Session.open`; fixed in `cdd540d` |
+| 2026-11-15 | Windows host `files ls` | no answer within 30 s after session ready (same as the Mac host) |
 
 ## 13. Open questions and protocol drift
 
