@@ -17,10 +17,14 @@ linked statically.
 
 ```sh
 zig build -Doptimize=ReleaseSafe             # zig-out/bin/uucli
+zig build -Doptimize=ReleaseSafe -p ~/.local # install to ~/.local/bin/uucli (-p = --prefix)
 zig build -Dtarget=x86_64-linux-musl         # static Linux binary
 zig build test                               # offline tests, no account needed
 zig build release                            # zig-out/release/uucli-VERSION-ARCH-OS.tar.gz
 ```
+
+Check `zig version` first: an older Zig fails with compile errors in `build.zig` rather than a
+version message.
 
 `zig build release` builds Linux x86_64/aarch64 (static musl) and macOS x86_64/aarch64; the macOS
 archives need a macOS host with the SDK installed.
