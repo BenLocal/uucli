@@ -9,3 +9,5 @@
 - 2026-11-15 本机若装了官方 UU 客户端，`/usr/local/bin/uuyc-cli` 可作对照：它经 XPC 驱动官方 app，`uuyc-cli term -d DEVICE list|new` 能判断问题在 uucli 还是在被控端状态。它和 uucli 抢同一个被控端，对照完要断开。
 - 2026-11-15 `files DEVICE ls` 对 Windows 被控端在会话就绪后 30 秒内没有应答（`the device did not answer in time`），对 Mac 被控端也一样；原因未查（待验证）。
 - 2026-11-15 远程终端的输出是 ConPTY 屏幕流，夹着大量 ANSI 控制序列；用管道喂命令时要先 `sleep` 等提示符、命令以 `\r` 结尾，结果需要剥掉 ANSI 再找，建议在命令输出里打一个独特前缀（如 `MARK:`）再 grep。
+- 2026-11-15 Windows 被控端上 `px` / `portmap` 能用：`ssh -o ProxyCommand='uucli px DEVICE 127.0.0.1 22' …` 完成密钥交换并走到认证阶段（被控端装有 Windows OpenSSH sshd）。前提同终端：被控端已解锁、没有其他主控端连着；否则会在会话就绪前失败（`control request refused by the host` 或 `signaling ended: RoomClosed`）。
+- 2026-11-15 会话就绪前失败时 uucli 曾 double free 并 panic（`src/session.zig` 的 arena 被 `errdefer arena.deinit()` 和 `errdefer s.close()` 各释放一次）→ 已修，回归测试是 `src/e2e_test.zig` 的 "session open fails cleanly after the session exists"。看到 `SafeAllocator … in free … session.zig` 的栈，先确认装的是修复后的二进制。
