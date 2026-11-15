@@ -83,6 +83,28 @@ No fuzzy or prefix matching.
 | `uucli files DEVICE put LOCAL REMOTE [--force]` | M4 | Uploads one file. |
 | `uucli debug device-info` / `debug rtc-loopback` | — | Diagnostics, not a stable interface: the machine fields of §5.2; the M0 WebRTC self test. |
 
+### 3.5 Short forms
+
+Fixed aliases, accepted everywhere the long form is. There is no prefix matching, so adding a
+command never changes what an existing abbreviation means.
+
+| Short | Long |
+| --- | --- |
+| `dev` | `device` |
+| `ls` | `device list`, `files DEVICE list` (`files` takes `ls` and `list`) |
+| `pm` | `portmap` |
+| `px` | `proxy` |
+| `term` | `terminal` |
+| `fs` | `files` |
+| `-j` | `--json` |
+| `-l` | `--list` |
+| `-k` | `--kill` |
+| `-f` | `--force` |
+| `-n` | `--no-reconnect` |
+
+`login` and `logout` have no short form: login is an interactive QR flow, and logout drops the
+account, so neither should be typed by accident.
+
 `ssh` integration example (documented in README at M2):
 
 ```sshconfig

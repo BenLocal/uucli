@@ -50,6 +50,12 @@ const usage_text =
     \\  terminal DEVICE [SESSION] [-e CHAR|none] | --list [--json] | --kill SESSION
     \\  files DEVICE ls REMOTE_DIR [--json] | get REMOTE LOCAL [--force] | put LOCAL REMOTE [--force]
     \\
+    \\DEVICE is a device id or name from `device list`.
+    \\
+    \\Short forms:
+    \\  dev = device, ls = list, pm = portmap, px = proxy, term = terminal, fs = files
+    \\  -j = --json, -l = --list, -k = --kill, -f = --force, -n = --no-reconnect
+    \\
     \\Options:
     \\  -v, -vv      More logging (info, debug) on stderr
     \\  --version    Print the version
@@ -138,7 +144,7 @@ fn run(app: *App, all_args: []const [:0]const u8) Exit {
         app.err.writeAll(usage_text) catch {};
         return .usage;
     }
-    const cmd = args[0];
+    const cmd = commandName(args[0]);
     const rest = args[1..];
     const result = if (eql(cmd, "login"))
         cmdLogin(app, rest)
@@ -159,6 +165,26 @@ fn run(app: *App, all_args: []const [:0]const u8) Exit {
     else
         return usage(app, "unknown command {s}", .{cmd});
     return result catch |err| errorExit(app, err);
+}
+
+/// Short command names (fixed aliases, no prefix matching, so a new command never changes what
+/// an existing abbreviation means).
+const command_aliases = [_][2][]const u8{
+    .{ "dev", "device" },
+    .{ "pm", "portmap" },
+    .{ "px", "proxy" },
+    .{ "term", "terminal" },
+    .{ "fs", "files" },
+};
+
+fn commandName(name: []const u8) []const u8 {
+    for (command_aliases) |a| if (eql(name, a[0])) return a[1];
+    return name;
+}
+
+/// `long` or its one-letter `short` form.
+fn isFlag(a: []const u8, long: []const u8, short: []const u8) bool {
+    return eql(a, long) or eql(a, short);
 }
 
 fn usage(app: *App, comptime fmt: []const u8, args: anytype) Exit {
@@ -258,10 +284,10 @@ pub fn fetchDevices(app: *App, client: *api.Client, cfg: *const config.Config) !
 }
 
 fn cmdDevice(app: *App, args: []const [:0]const u8) !Exit {
-    if (args.len == 0 or !eql(args[0], "list")) return usage(app, "expected `device list [--json]`", .{});
+    if (args.len == 0 or !(eql(args[0], "list") or eql(args[0], "ls"))) return usage(app, "expected `device list [--json]`", .{});
     var json = false;
     for (args[1..]) |a| {
-        if (eql(a, "--json")) json = true else return usage(app, "unknown argument {s}", .{a});
+        if (isFlag(a, "--json", "-j")) json = true else return usage(app, "unknown argument {s}", .{a});
     }
     var cfg: config.Config = undefined;
     var client: api.Client = undefined;
@@ -347,7 +373,7 @@ fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (eql(a, "--no-reconnect")) {
+        if (isFlag(a, "--no-reconnect", "-n")) {
             reconnect = false;
         } else if (eql(a, "-L") or std.mem.startsWith(u8, a, "-L")) {
             const spec = if (a.len > 2) a[2..] else blk: {
@@ -682,11 +708,11 @@ fn cmdTerminal(app: *App, args: []const [:0]const u8) !Exit {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (eql(a, "--list")) {
+        if (isFlag(a, "--list", "-l")) {
             list = true;
-        } else if (eql(a, "--json")) {
+        } else if (isFlag(a, "--json", "-j")) {
             json = true;
-        } else if (eql(a, "--kill") or eql(a, "-e")) {
+        } else if (isFlag(a, "--kill", "-k") or eql(a, "-e")) {
             i += 1;
             if (i == args.len) return usage(app, "{s} needs a value", .{a});
             const v = args[i];
@@ -855,13 +881,13 @@ fn cmdFiles(app: *App, args: []const [:0]const u8) !Exit {
     var json = false;
     var force = false;
     for (args) |a| {
-        if (eql(a, "--json")) json = true else if (eql(a, "--force")) force = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
+        if (isFlag(a, "--json", "-j")) json = true else if (isFlag(a, "--force", "-f")) force = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
     }
     const p = pos.items;
     if (p.len < 2) return usage(app, usage_files, .{});
     const op = p[1];
     var cmd: FilesCmd = undefined;
-    if (eql(op, "ls") and p.len == 3 and !force) {
+    if ((eql(op, "ls") or eql(op, "list")) and p.len == 3 and !force) {
         cmd = .{ .op = .{ .ls = .{ .path = p[2], .json = json } } };
     } else if (eql(op, "get") and p.len == 4 and !json) {
         if (!force) if (Io.Dir.cwd().statFile(app.io, p[3], .{})) |_| {
@@ -981,6 +1007,20 @@ test {
     _ = interrupts;
     _ = @import("e2e_test.zig");
     _ = @import("vectors_test.zig");
+}
+
+test "short forms" {
+    try std.testing.expectEqualStrings("device", commandName("dev"));
+    try std.testing.expectEqualStrings("portmap", commandName("pm"));
+    try std.testing.expectEqualStrings("proxy", commandName("px"));
+    try std.testing.expectEqualStrings("terminal", commandName("term"));
+    try std.testing.expectEqualStrings("files", commandName("fs"));
+    try std.testing.expectEqualStrings("login", commandName("login"));
+    // No prefix matching.
+    try std.testing.expectEqualStrings("ter", commandName("ter"));
+    try std.testing.expect(isFlag("-j", "--json", "-j"));
+    try std.testing.expect(isFlag("--json", "--json", "-j"));
+    try std.testing.expect(!isFlag("--js", "--json", "-j"));
 }
 
 test "displayWidth" {

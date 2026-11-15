@@ -84,6 +84,22 @@ uucli files office-pc put backup.tar /home/me/backup.tar
 One regular file per transfer. Remote paths are passed through as written. `get` writes
 `LOCAL.uucli-part` and renames it when complete. Ctrl-C cancels and tells the host.
 
+## Short forms
+
+For scripts and agents every command has a fixed short form (no prefix matching):
+
+```sh
+uucli dev ls -j                    # device list --json
+uucli term office-pc -l -j         # terminal office-pc --list --json
+uucli term office-pc -k 3          # terminal office-pc --kill 3
+uucli fs office-pc ls 'C:\Users\me' -j
+uucli fs office-pc get 'C:\Users\me\a.zip' a.zip -f
+uucli pm office-pc -L 2222:127.0.0.1:22 -n
+uucli px office-pc 127.0.0.1 22
+```
+
+`login` and `logout` have none.
+
 ## Keep a port mapping running (systemd)
 
 ```sh
