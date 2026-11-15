@@ -26,6 +26,10 @@ pub const Kind = struct {
 };
 
 const header_len = 16;
+/// Cap on the cleaned text `exec` keeps while waiting for its end marker.
+pub const max_exec_output = 16 * 1024 * 1024;
+/// Cap on the command `exec` sends (before encoding).
+pub const max_exec_command = 8 * 1024;
 const max_payload = 1024 * 1024;
 const max_buffer = 2 * 1024 * 1024;
 const max_stdin_chunk = 16 * 1024;
@@ -129,6 +133,10 @@ pub const Error = error{
     /// The session or the TERM stream failed (exit 5).
     SessionEnded,
     InvalidResponse,
+    /// `exec`: the command did not finish within its timeout (exit 6).
+    CommandTimeout,
+    /// `exec`: the command printed more than `max_exec_output` (exit 6).
+    OutputLimit,
 } || Allocator.Error || Io.Cancelable;
 
 pub const Terminal = struct {
@@ -349,6 +357,42 @@ pub const Terminal = struct {
         t.sendFrame(Kind.close, id, "") catch {};
     }
 
+    /// `exec`: types `line` (from `execLine`) into session `id` and waits for the end marker.
+    /// Output is cleaned with `Stripper` into `text`; the result's slices point into it. A shell
+    /// that exits before the end marker (the command ran `exit`) ends with that exit code.
+    pub fn exec(t: *Terminal, id: u32, line: []const u8, nonce: []const u8, timeout: ?Io.Duration, text: *std.ArrayList(u8)) Error!ExecOutput {
+        const deadline = if (timeout) |d| Io.Clock.awake.now(t.io).addDuration(d) else null;
+        var strip: Stripper = .{};
+        try t.write(id, line);
+        while (true) {
+            if (t.overflow.load(.acquire)) return error.SessionEnded;
+            const m = t.queue.getOne(t.io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Closed => return error.SessionEnded,
+            };
+            defer m.deinit(t.gpa);
+            switch (m) {
+                .output => |d| {
+                    if (text.items.len + d.len > max_exec_output) return error.OutputLimit;
+                    try strip.feed(t.gpa, text, d);
+                    if (extract(text.items, nonce)) |r| return r;
+                },
+                .exit => |code| return extract(text.items, nonce) orelse .{ .output = afterStart(text.items, nonce), .code = code },
+                .failed, .session_end => return error.SessionEnded,
+                .input_end => {
+                    // Ctrl-C / SIGTERM: interrupt the remote command too.
+                    t.write(id, "\x03") catch {};
+                    return error.Canceled;
+                },
+                .tick => if (deadline) |dl| if (Io.Clock.awake.now(t.io).compare(.gt, dl)) {
+                    t.write(id, "\x03") catch {};
+                    return error.CommandTimeout;
+                },
+                .reply, .input, .resize => {},
+            }
+        }
+    }
+
     pub const Attach = struct {
         id: u32,
         out: *Io.Writer,
@@ -417,6 +461,106 @@ pub const Terminal = struct {
                 .reply, .tick => {},
             }
         }
+    }
+};
+
+// --- exec ------------------------------------------------------------------------------------
+
+/// Which wrapper `execLine` builds: PowerShell for the official Windows host, sh otherwise.
+pub const Shell = enum { powershell, posix };
+
+pub const ExecOutput = struct { output: []const u8, code: i64 };
+
+/// The input line that prints a start marker, runs `command`, prints an end marker with its exit
+/// status and exits the shell with it. Markers are `UUCLI-S-NONCE` and `UUCLI-E-NONCE:CODE`; the
+/// line builds them by concatenation, so the terminal's echo of the line never contains them.
+/// PowerShell gets the command base64-encoded through `Invoke-Expression` in `try`, so quoting and
+/// parse errors in it still reach the end marker.
+pub fn execLine(gpa: Allocator, shell: Shell, nonce: []const u8, command: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    switch (shell) {
+        .powershell => {
+            const enc = std.base64.standard.Encoder;
+            const b64 = try gpa.alloc(u8, enc.calcSize(command.len));
+            defer gpa.free(b64);
+            _ = enc.encode(b64, command);
+            try out.print(gpa, "$global:LASTEXITCODE=0; Write-Output ('UU'+'CLI-S-{s}'); " ++
+                "try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{s}'))); $o=$? }} " ++
+                "catch {{ $_; $o=$false }}; $u=if ($LASTEXITCODE) {{ $LASTEXITCODE }} elseif ($o) {{ 0 }} else {{ 1 }}; " ++
+                "Write-Output ('UU'+'CLI-E-{s}:'+$u); exit $u\r", .{ nonce, b64, nonce });
+        },
+        .posix => {
+            try out.print(gpa, "printf '%s\\n' \"UU\"\"CLI-S-{s}\"; eval '", .{nonce});
+            for (command) |c| if (c == '\'') try out.appendSlice(gpa, "'\\''") else try out.append(gpa, c);
+            try out.print(gpa, "'; u=$?; printf '%s\\n' \"UU\"\"CLI-E-{s}:$u\"; exit $u\r", .{nonce});
+        },
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The command output between the markers and its exit code, once the end marker line is complete.
+pub fn extract(text: []const u8, nonce: []const u8) ?ExecOutput {
+    var buf: [64]u8 = undefined;
+    const end = std.fmt.bufPrint(&buf, "UUCLI-E-{s}:", .{nonce}) catch return null;
+    const body = bodyStart(text, nonce) orelse return null;
+    const e = std.mem.indexOfPos(u8, text, body, end) orelse return null;
+    const nl = std.mem.indexOfScalarPos(u8, text, e + end.len, '\n') orelse return null;
+    const code = std.fmt.parseInt(i64, std.mem.trim(u8, text[e + end.len .. nl], " \t"), 10) catch return null;
+    const out_end = if (std.mem.lastIndexOfScalar(u8, text[body..e], '\n')) |i| body + i + 1 else body;
+    return .{ .output = text[body..out_end], .code = code };
+}
+
+/// Text after the start marker's line (all of it when the marker never came).
+fn afterStart(text: []const u8, nonce: []const u8) []const u8 {
+    return text[bodyStart(text, nonce) orelse return text..];
+}
+
+fn bodyStart(text: []const u8, nonce: []const u8) ?usize {
+    var buf: [64]u8 = undefined;
+    const start = std.fmt.bufPrint(&buf, "UUCLI-S-{s}", .{nonce}) catch return null;
+    const s = std.mem.indexOf(u8, text, start) orelse return null;
+    return (std.mem.indexOfScalarPos(u8, text, s + start.len, '\n') orelse return null) + 1;
+}
+
+/// Turns host terminal output into plain text for `exec`: drops CSI, OSC and two-byte escape
+/// sequences, CR and other control characters. `ESC [ n C` (cursor forward), which ConPTY sends
+/// for runs of spaces, becomes n spaces. Screen redraws are not interpreted.
+pub const Stripper = struct {
+    state: enum { text, esc, csi, osc, osc_esc } = .text,
+    param: u32 = 0,
+
+    pub fn feed(s: *Stripper, gpa: Allocator, out: *std.ArrayList(u8), data: []const u8) Allocator.Error!void {
+        for (data) |b| switch (s.state) {
+            .text => switch (b) {
+                0x1b => s.state = .esc,
+                '\n', '\t' => try out.append(gpa, b),
+                else => if (b >= 0x20 and b != 0x7f) try out.append(gpa, b),
+            },
+            .esc => switch (b) {
+                '[' => {
+                    s.state = .csi;
+                    s.param = 0;
+                },
+                ']' => s.state = .osc,
+                else => s.state = .text,
+            },
+            .csi => switch (b) {
+                '0'...'9' => s.param = s.param *| 10 +| (b - '0'),
+                ';' => s.param = 0,
+                0x40...0x7e => {
+                    if (b == 'C') try out.appendNTimes(gpa, ' ', @min(@max(s.param, 1), 1000));
+                    s.state = .text;
+                },
+                else => {},
+            },
+            .osc => switch (b) {
+                0x07 => s.state = .text,
+                0x1b => s.state = .osc_esc,
+                else => {},
+            },
+            .osc_esc => s.state = if (b == '\\') .text else .osc,
+        };
     }
 };
 
@@ -524,6 +668,43 @@ test "parseList, exit code, session id" {
     try testing.expectEqual(@as(i64, -1), exitCode("x"));
     try testing.expectEqual(@as(u32, 9), sessionIdOf("{\"code\":0,\"session_id\":\"9\"}"));
     try testing.expectEqual(@as(u32, 0), sessionIdOf("{\"code\":0,\"message\":\"ok\"}"));
+}
+
+test "exec: strip ConPTY output and extract the result" {
+    const gpa = testing.allocator;
+    const nonce = "0123abcd";
+    // Shaped like real Windows host output: OSC title, screen modes, coloured echo of the typed
+    // line (which spells the markers as 'UU'+'CLI-...'), spaces as ESC[1C, CRLF line ends.
+    const raw = "\x1b[?9001h\x1b]0;C:\\WINDOWS\\powershell.exe\x07\x1b[?25lPS C:\\Users\\me>\x1b[K\r\n" ++
+        "\x1b[93mWrite-Output\x1b[m ('UU'+'CLI-S-0123abcd'); ... ('UU'+'CLI-E-0123abcd:'+$u)\r\n" ++
+        "UUCLI-S-0123abcd\r\nStatus\x1b[3CName\r\n" ++
+        "Running\x1b[1Csshd\x1b[K\r\nUUCLI-E-0123abcd:3\r\nPS\x1b[1CC:\\Users\\me>";
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var s: Stripper = .{};
+    // Fed in two chunks that split an escape sequence.
+    try s.feed(gpa, &text, raw[0..120]);
+    try testing.expect(extract(text.items, nonce) == null);
+    try s.feed(gpa, &text, raw[120..]);
+    const r = extract(text.items, nonce).?;
+    try testing.expectEqualStrings("Status   Name\nRunning sshd\n", r.output);
+    try testing.expectEqual(@as(i64, 3), r.code);
+    // The end marker line must be complete.
+    try testing.expect(extract("UUCLI-S-0123abcd\nx\nUUCLI-E-0123abcd:1", nonce) == null);
+    try testing.expectEqualStrings("x\n", afterStart("echo\nUUCLI-S-0123abcd\nx\n", nonce));
+}
+
+test "exec: wrapper lines" {
+    const gpa = testing.allocator;
+    const ps = try execLine(gpa, .powershell, "n1", "Get-Service 'sshd'");
+    defer gpa.free(ps);
+    try testing.expect(std.mem.indexOf(u8, ps, "UUCLI-") == null);
+    try testing.expect(std.mem.indexOf(u8, ps, "FromBase64String('R2V0LVNlcnZpY2UgJ3NzaGQn')") != null);
+    try testing.expect(std.mem.endsWith(u8, ps, "exit $u\r"));
+    const sh = try execLine(gpa, .posix, "n1", "echo 'a b'");
+    defer gpa.free(sh);
+    try testing.expect(std.mem.indexOf(u8, sh, "UUCLI-") == null);
+    try testing.expectEqualStrings("printf '%s\\n' \"UU\"\"CLI-S-n1\"; eval 'echo '\\''a b'\\'''; u=$?; printf '%s\\n' \"UU\"\"CLI-E-n1:$u\"; exit $u\r", sh);
 }
 
 test {

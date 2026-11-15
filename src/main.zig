@@ -36,6 +36,8 @@ pub const Exit = enum(u8) {
     connect = 5,
     remote = 6,
     interrupted = 130,
+    /// `exec` passes the remote command's exit status through.
+    _,
 };
 
 const usage_text =
@@ -49,12 +51,15 @@ const usage_text =
     \\  proxy DEVICE HOST PORT                  Connect stdin/stdout to HOST:PORT (ssh ProxyCommand)
     \\  terminal DEVICE [SESSION] [-e CHAR|none] | --list [--json] | --kill SESSION
     \\  files DEVICE ls REMOTE_DIR [--json] | get REMOTE LOCAL [--force] | put LOCAL REMOTE [--force]
+    \\  exec DEVICE [--timeout SECONDS] [--json] [--] COMMAND...
+    \\                                          Run one command in a new remote shell, print its output
+    \\                                          and exit with its exit status
     \\
     \\DEVICE is a device id or name from `device list`.
     \\
     \\Short forms:
-    \\  dev = device, ls = list, pm = portmap, px = proxy, term = terminal, fs = files
-    \\  -j = --json, -l = --list, -k = --kill, -f = --force, -n = --no-reconnect
+    \\  dev = device, ls = list, pm = portmap, px = proxy, term = terminal, fs = files, x = exec
+    \\  -j = --json, -l = --list, -k = --kill, -f = --force, -n = --no-reconnect, -t = --timeout
     \\
     \\Options:
     \\  -v, -vv      More logging (info, debug) on stderr
@@ -160,6 +165,8 @@ fn run(app: *App, all_args: []const [:0]const u8) Exit {
         cmdTerminal(app, rest)
     else if (eql(cmd, "files"))
         cmdFiles(app, rest)
+    else if (eql(cmd, "exec"))
+        cmdExec(app, rest)
     else if (eql(cmd, "debug"))
         cmdDebug(app, rest)
     else
@@ -175,6 +182,7 @@ const command_aliases = [_][2][]const u8{
     .{ "px", "proxy" },
     .{ "term", "terminal" },
     .{ "fs", "files" },
+    .{ "x", "exec" },
 };
 
 fn commandName(name: []const u8) []const u8 {
@@ -461,6 +469,10 @@ fn cmdProxy(app: *App, args: []const [:0]const u8) !Exit {
 
 /// DEVICE (id or name) → device id; exit 2 when ambiguous, 4 when unknown or offline.
 fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, query: []const u8) ![]const u8 {
+    return (try resolveDevice(app, client, cfg, query)).id;
+}
+
+fn resolveDevice(app: *App, client: *api.Client, cfg: *const config.Config, query: []const u8) !api.Device {
     const devices = try fetchDevices(app, client, cfg);
     switch (try api.resolveDevice(app.arena, devices, query)) {
         .found => |d| {
@@ -468,7 +480,7 @@ fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, quer
                 _ = app.fail(.no_device, "device {s} ({s}) is offline", .{ d.name, d.id });
                 return error.ReportedNoDevice;
             }
-            return d.id;
+            return d;
         },
         .not_found => {
             _ = app.fail(.no_device, "no device {s}: see `uucli device list`", .{query});
@@ -629,7 +641,9 @@ fn runToolSession(
     var client: api.Client = undefined;
     try signedInClient(app, &client, &cfg);
     defer client.deinit();
-    const target = try resolveTarget(app, &client, &cfg, query);
+    const device = try resolveDevice(app, &client, &cfg, query);
+    const target = device.id;
+    if (@hasDecl(Tool, "device")) tool_state.device(device);
 
     var bus_buf: [256]session.Event = undefined;
     var bus: session.Bus = undefined;
@@ -668,6 +682,9 @@ fn runToolSession(
         if (after != .stopped) tool_state.sessionEnded();
     } else if (end != .stopped) tool_state.sessionEnded();
     const code = task.await(app.io);
+    // A tool that already has its result (exec: the remote shell exits right after printing it)
+    // does not fail because the host then closed the session.
+    if (@hasDecl(Tool, "completed") and tool_state.completed()) return code;
     return switch (end) {
         .stopped => code,
         .interrupted => interruptedExit(),
@@ -746,9 +763,115 @@ fn terminalError(app: *App, err: terminal.Error) Exit {
         error.RemoteTimeout => app.fail(.remote, "the device did not answer the terminal request", .{}),
         error.InvalidResponse => app.fail(.remote, "invalid terminal response from the device", .{}),
         error.SessionEnded => app.fail(.connect, "the terminal session failed", .{}),
+        error.CommandTimeout => app.fail(.remote, "the command did not finish in time", .{}),
+        error.OutputLimit => app.fail(.remote, "the command printed more than {d} MiB", .{terminal.max_exec_output / (1024 * 1024)}),
         error.Canceled => .interrupted,
         error.OutOfMemory => app.fail(.other, "out of memory", .{}),
     };
+}
+
+// --- exec ------------------------------------------------------------------------------------
+
+const ExecCmd = struct {
+    t: terminal.Terminal = undefined,
+    command: []const u8,
+    timeout: ?Io.Duration,
+    json: bool,
+    shell: terminal.Shell = .posix,
+    /// Set once the command's result is in.
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn completed(c: *ExecCmd) bool {
+        return c.done.load(.acquire);
+    }
+    fn device(c: *ExecCmd, d: api.Device) void {
+        // The official Windows host runs PowerShell; other hosts run a POSIX shell.
+        c.shell = if (d.platform == .windows) .powershell else .posix;
+    }
+    fn bind(c: *ExecCmd, io: Io, gpa: Allocator, s: *session.Session) void {
+        c.t.init(io, gpa, s);
+    }
+    fn unbind(c: *ExecCmd) void {
+        c.t.deinit();
+    }
+    fn tool(c: *ExecCmd) session.Tool {
+        return c.t.tool();
+    }
+    fn sessionEnded(c: *ExecCmd) void {
+        c.t.post(.session_end);
+    }
+    fn interrupted(c: *ExecCmd) void {
+        c.t.post(.input_end);
+    }
+};
+
+fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
+    const usage_exec = "expected `exec DEVICE [--timeout SECONDS] [--json] [--] COMMAND...`";
+    var device: ?[]const u8 = null;
+    var timeout_s: u32 = 300;
+    var json = false;
+    var i: usize = 0;
+    // Options come before COMMAND; the first other word after DEVICE (or `--`) starts it, so the
+    // command can have options of its own.
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (eql(a, "--")) {
+            i += 1;
+            break;
+        } else if (isFlag(a, "--json", "-j")) {
+            json = true;
+        } else if (isFlag(a, "--timeout", "-t")) {
+            i += 1;
+            if (i == args.len) return usage(app, "{s} needs a number of seconds", .{a});
+            timeout_s = std.fmt.parseInt(u32, args[i], 10) catch return usage(app, "invalid timeout {s}", .{args[i]});
+        } else if (a.len > 1 and a[0] == '-' and device == null) {
+            return usage(app, "unknown option {s}", .{a});
+        } else if (device == null) {
+            device = a;
+        } else break;
+    }
+    const query = device orelse return usage(app, usage_exec, .{});
+    if (i == args.len) return usage(app, usage_exec, .{});
+    var command: std.ArrayList(u8) = .empty;
+    for (args[i..], 0..) |w, n| {
+        if (n != 0) try command.append(app.arena, ' ');
+        try command.appendSlice(app.arena, w);
+    }
+    if (command.items.len > terminal.max_exec_command) return usage(app, "COMMAND is longer than {d} bytes", .{terminal.max_exec_command});
+    var cmd: ExecCmd = .{
+        .command = command.items,
+        .timeout = if (timeout_s == 0) null else .fromSeconds(timeout_s),
+        .json = json,
+    };
+    return runToolSession(app, query, 8, ExecCmd, &cmd, execWorker);
+}
+
+fn execWorker(app: *App, cmd: *ExecCmd) Exit {
+    const t = &cmd.t;
+    var group: Io.Group = .init;
+    defer group.cancel(app.io);
+    group.concurrent(app.io, terminal.Terminal.ticker, .{t}) catch return app.fail(.other, "cannot start the terminal", .{});
+    t.checkEnv() catch |err| return switch (err) {
+        error.Rejected => app.fail(.remote, "the terminal environment is unavailable on the device", .{}),
+        else => terminalError(app, err),
+    };
+    // Wide, so the shell does not wrap output lines.
+    const id = t.open(app.arena, 0, 1000, 50) catch |err| return terminalError(app, err);
+    defer t.close(id);
+    var nonce_raw: [8]u8 = undefined;
+    app.io.random(&nonce_raw);
+    const nonce = std.fmt.bytesToHex(nonce_raw, .lower);
+    const line = terminal.execLine(app.arena, cmd.shell, &nonce, cmd.command) catch return app.fail(.other, "out of memory", .{});
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(app.gpa);
+    const r = t.exec(id, line, &nonce, cmd.timeout, &text) catch |err| return terminalError(app, err);
+    cmd.done.store(true, .release);
+    if (cmd.json) {
+        std.json.Stringify.value(.{ .exit_code = r.code, .output = r.output }, .{}, app.out) catch {};
+        app.out.writeByte('\n') catch {};
+    } else app.out.writeAll(r.output) catch {};
+    // Statuses outside 0..255 (Windows NTSTATUS values, negative numbers) become 1.
+    return if (r.code >= 0 and r.code <= 255) @enumFromInt(r.code) else .other;
 }
 
 fn terminalWorker(app: *App, cmd: *TerminalCmd) Exit {
@@ -1015,6 +1138,7 @@ test "short forms" {
     try std.testing.expectEqualStrings("proxy", commandName("px"));
     try std.testing.expectEqualStrings("terminal", commandName("term"));
     try std.testing.expectEqualStrings("files", commandName("fs"));
+    try std.testing.expectEqualStrings("exec", commandName("x"));
     try std.testing.expectEqualStrings("login", commandName("login"));
     // No prefix matching.
     try std.testing.expectEqualStrings("ter", commandName("ter"));
