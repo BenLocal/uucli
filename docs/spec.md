@@ -51,6 +51,9 @@ acting as a controlled host, Windows as the uucli platform.
 | 6 | Remote side refused or timed out: API `2002` (host already being controlled), port-forward target rejected, RPC timeout, remote shell/file error |
 | 130 | Interrupted by SIGINT (only where Ctrl-C reaches uucli, i.e. not inside `terminal`) |
 
+SIGTERM ends `portmap` / `proxy` like SIGINT but exits 0, so a service manager stopping the unit
+sees a clean exit. SIGPIPE is ignored: a closed local socket or stdout is a write error.
+
 ### 3.3 `DEVICE` resolution
 
 `DEVICE` is resolved against `GET /api/v1/device/list` (both `my_binded_devices` and
@@ -78,6 +81,7 @@ No fuzzy or prefix matching.
 | `uucli files DEVICE ls REMOTE_DIR [--json]` | M4 | Lists one remote directory. |
 | `uucli files DEVICE get REMOTE LOCAL [--force]` | M4 | Downloads one file. |
 | `uucli files DEVICE put LOCAL REMOTE [--force]` | M4 | Uploads one file. |
+| `uucli debug device-info` / `debug rtc-loopback` | — | Diagnostics, not a stable interface: the machine fields of §5.2; the M0 WebRTC self test. |
 
 `ssh` integration example (documented in README at M2):
 
@@ -94,7 +98,7 @@ Host office-pc
 | Path | `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `~/.config/uucli/config.json` (macOS too) |
 | Permissions | file `0600`, directory `0700`; uucli refuses to read a config readable by group/other and says how to fix it |
 | Writes | write `config.json.tmp` (0600) → fsync → rename |
-| Locking | `flock` on `config.lock` around device registration and login, so two `uucli login` runs cannot register two devices |
+| Locking | Lock files are named after the config file's stem (`config.json` → `config.lock`, `config.login.lock`). Blocking `flock` on `STEM.lock` around device registration and login (and `logout`), so two processes cannot register two devices |
 
 ```json
 {
@@ -177,10 +181,12 @@ Runs under the config lock, only when `device_id` is empty. Missing `client_id` 
 | `cpu` | `model name` from `/proc/cpuinfo` | `sysctl machdep.cpu.brand_string` |
 | `base_board` | `/sys/class/dmi/id/board_{vendor,name}` or `Unknown` | `hw.model` |
 | `video` | `["Unknown"]` | `["Unknown"]` |
-| `mac` | first physical interface, uppercase, dash form, or empty | same |
+| `mac` | first interface (by name) with a `/sys/class/net/*/device` link, uppercase, dash form, or empty | first `en*` Ethernet link address (`getifaddrs`) |
 | `memory` | MiB | MiB |
 | `screen` | `1920x1080` (constant: headless) | `1920x1080` |
 
+`HOSTNAME` is `gethostname()`; on macOS `scutil --get LocalHostName` when set (`gethostname` there often
+returns a DHCP name or address). `uucli debug device-info` prints these machine fields without sending them.
 If the machine source is unreadable, `machine_guid` is a random UUID. Because it is saved, it stays
 the same afterwards. Response: `data.device_id` → saved immediately, even if the QR step is abandoned.
 
@@ -193,7 +199,7 @@ Upstream: `src/login.rs` `flow`, `qr_poll_action`, `qr_ticket`, `csrf_from_token
 
 1. `POST /api/v1/qrcode/gen/login` with an **empty body** (sign the empty string).
    `data.qrcode_jump_url` is the QR content. The status ticket is `data.status_query_ticket`,
-   falling back to `data.token` if absent.
+   falling back to `data.token` only if the key is absent (present but empty = no ticket, exit 1).
 2. Render the QR to stderr with Unicode half blocks (2 modules per character row), quiet zone on,
    dark-on-light inverted for dark terminals as upstream does. Below it print
    `Scan with the UU Remote mobile app`.
@@ -214,7 +220,8 @@ Upstream: `src/login.rs` `flow`, `qr_poll_action`, `qr_ticket`, `csrf_from_token
    Save `data.token`, `data.user_id`, `data.nickname` (as `account_name`), and `csrf` = the `csrf` claim
    of the JWT payload (base64url, no padding). Missing token/user_id/csrf → exit 1.
 
-Only one login per config file runs at a time (non-blocking `flock` on `login.lock`; second run exits 1).
+Only one login per config file runs at a time (non-blocking `flock` on `STEM.login.lock`; second run exits 1).
+The login requests carry only the device identity (`client_id`, `system_id`, `device_id`), never an older token.
 
 ### 5.4 Device list
 
@@ -326,6 +333,7 @@ Wait up to 12 s for ack `N`: it must be `["success", {...}]`. From the ack objec
 - `client_id`: remote route, required.
 - `iceServers[]`: `{urls: string|string[], username?, credential?}`; URL schemes limited to
   `stun:`, `stuns:`, `turn:`, `turns:`. Empty list = host candidates only (never add a public STUN).
+  `stuns:` entries are accepted but skipped (logged at info): libdatachannel does not support them.
 - `force_relay` (bool, default false): relay-only ICE policy; requires at least one TURN URL.
 
 Events received before the ack are buffered (max 64) and processed afterwards.
@@ -411,7 +419,11 @@ FRAME = {1: session (varint, always 1), 2: rule_id, 3: stream_id, 4: type, 5: pa
 | 1 CLOSE | both | empty |
 | 4 | in | ignored |
 
-- `rule_id`: one per `-L` (1, 2, ...). `stream_id`: process-wide counter, unique across rules.
+- `rule_id` and `stream_id` come from one process-wide counter, as upstream: rules take 1..n in
+  `-L` order, streams continue from n + 1 and are unique across rules and reconnects.
+- Inbound frames for a stream go to a bounded queue (64 frames); if it is full the stream is closed
+  (upstream drops the route). After SYN-ACK, inbound CLOSE ends the stream, type 4 is ignored and
+  any other type than DATA is an error that ends the stream.
 - Per accepted TCP connection: send SYN, wait ≤ 12 s for SYN-ACK; a timeout or rejection closes the
   local socket (logged at warn, counted). Then copy both ways until either side closes; always send
   CLOSE at the end. TCP half-close is not supported (closing one direction closes the stream).
@@ -432,18 +444,23 @@ Default on for `portmap`, off for `proxy`.
 
 ## 8. Concurrency model
 
-- One process, one `std.Io` instance (threaded implementation unless the M0 spike shows the evented
-  one works with libdatachannel's wakeups).
+- One process, one `std.Io` instance: `std.Io.Threaded`, the one `std.process.Init` provides.
 - libdatachannel invokes callbacks (`onOpen`, `onMessage`, `onLocalCandidate`, `onStateChange`, ...)
-  on its own threads. `rtc.zig` copies the data and pushes an event onto a bounded MPSC queue; nothing
-  else runs in the callback. No other module sees libdatachannel threads or handles.
+  on its own threads. `rtc.zig` copies the data and pushes an event onto a bounded `std.Io.Queue`
+  (blocking when full, never dropping); nothing else runs in the callback. No other module sees
+  libdatachannel threads or handles.
+- The queue lives in a single process-wide `Hub` in static memory, because libdatachannel can invoke a
+  callback after its peer is closed. `Hub.shutdown` sets a closing flag, closes the queue and waits for
+  in-flight callbacks; later callbacks only read the flag. Peers from an earlier session (portmap
+  reconnect) share the hub; consumers ignore events whose peer id is not current.
+- `rtcCleanup()` is never called: it can deadlock against libdatachannel's own asynchronous channel
+  close (observed in the M0 spike).
 - `session.zig` owns signaling and the PeerConnection and drives the state machine from that queue.
 - Tools (`portmap`, `terminal`, `files`) receive routed messages from `session.zig` and send through a
   `send(channel, bytes)` function that implements the back-pressure rule of §6.6.
 
-The exact `std.Io` API is verified against the Zig 0.17.1 standard library in M0; the design only relies
-on: TCP listen/accept/connect, TLS client, timers, cancellation, and a queue that a foreign thread can
-push to.
+The design relies on these `std.Io` features: TCP listen/accept/connect, TLS client, timers,
+cancellation, and `Io.Queue` (thread-safe, so libdatachannel threads can push to it).
 
 ## 9. Module layout
 
@@ -464,9 +481,10 @@ uucli/
     ├── ws.zig             # WebSocket client
     ├── signal.zig         # Engine.IO/Socket.IO framing, control request, soac
     ├── rtc.zig            # libdatachannel binding, event queue
-    ├── session.zig        # join → signal → rtc → echo → ready; routing; reconnect
+    ├── session.zig        # join → signal → rtc → echo → ready; routing
+    ├── interrupts.zig     # SIGINT/SIGTERM self-pipe → session bus
     ├── wire.zig           # protobuf wire encode/decode, envelope, echo, connect options
-    ├── tty.zig            # termios raw mode, window size, SIGWINCH
+    ├── tty.zig            # termios raw mode, window size
     └── tools/
         ├── portmap.zig    # portmap + proxy
         ├── terminal.zig
@@ -489,8 +507,12 @@ uucli/
 ## 10. Testing
 
 - `zig build test` runs offline and needs no account or device.
-- **Golden vectors**: `tools/gen-vectors` is a small Rust program that depends on the upstream crate at
-  the pinned commit and writes JSON/hex files to `tests/vectors/`. Vectors are committed; regenerating
+- **Golden vectors**: `tools/gen-vectors` is a small Rust program that compiles upstream code at the
+  pinned commit and writes JSON files to `tests/vectors/`. Upstream is a binary crate with heavy system
+  dependencies, so its `build.rs` copies self-contained modules (`auth.rs`) and extracts single items
+  verbatim from the others (`login.rs`: `qr_poll_action`, `qr_ticket`, `csrf_from_token`, ...) into the
+  generator; it refuses a checkout that is not at the pinned commit
+  (`UPSTREAM_DIR=... cargo run -- ../../tests/vectors`). `zig build test` embeds the files. Vectors are committed; regenerating
   them is only needed when the upstream pin changes. Required vectors:
   - request signing: method, path, header map, body → signature;
   - `build_headers` with and without token;
@@ -503,39 +525,120 @@ uucli/
 - Unit tests without vectors: Socket.IO frame parser (including binary attachments), WebSocket framing
   (masking, fragmented and control frames), config permission checks, `DEVICE` resolution, CLI parsing,
   exit-code mapping.
-- Loopback test: a fake signaling server and a second libdatachannel peer in-process play the host side
-  of §6–§7 so `portmap` can be tested end to end without the cloud (M2).
+- Loopback test (`src/e2e_test.zig`): a fake REST API, a fake Socket.IO server and a second
+  libdatachannel peer in-process play the cloud and host side of §6–§7, forwarding to a local TCP echo
+  server, so `portmap` is tested end to end without the cloud (M2). The host peer's events are taken
+  off the shared event hub by a test-only hook on the session bus (`Bus.divert`).
+- The same harness drives `terminal` (open, list, kill, escapes, exit code) and `files` (list,
+  upload, a host-driven download with out-of-order blocks) end to end.
+- `zig build test -Dtest-filter=NAME` runs a subset.
 - Real-device checks are manual and listed per milestone in §12.
 
-## 11. Later milestones (contract only)
+## 11. Terminal, files and packaging (M3–M5)
 
-Protocol details for these are written into this spec after M2 is accepted.
+The wire protocol below was ported from upstream before M2 passed on a real device, so the original
+"after M2" ordering was not kept. It is verified against the in-process fake host (§10) only; the
+real-device checks of §12 are still open for M2–M4.
 
 ### 11.1 Terminal (M3)
 
-- Attach: with stdin a tty, enter raw mode, send initial window size, forward SIGWINCH resizes.
-  With stdin not a tty, no raw mode; stdin is forwarded as-is and EOF closes the remote input.
-- Escape sequences (like ssh), only at the start of a line: `~.` detach (remote session keeps running),
-  `~?` help, `~~` sends `~`. `-e CHAR` changes the escape char, `-e none` disables it.
-- Remote shell exit code N ≠ 0 → uucli exits 6 and prints the code on stderr; exit 0 → uucli exits 0.
-- Terminal is always restored on exit, including on signals and errors.
-- `--list` output columns: session id, name, state; `--json` gives the same as an array.
+Upstream: `src/viewer/tools/terminal.rs`, `src/viewer/tools/cli.rs`, host side `src/terminal.rs`.
+Session capture type 8 (§6); everything except the environment check is a TERM frame on **BINARY**:
+
+```text
+"TERM" 01 KIND 00 00 SESSION (u32 le) LEN (u32 le) PAYLOAD
+```
+
+KIND is 1..16; LEN ≤ 1 MiB; a frame may span BINARY messages (reassembly buffer ≤ 2 MiB, overflow
+fails the terminal).
+
+| KIND | Direction | Payload |
+| --- | --- | --- |
+| 1 OPEN | out | `{"cols":C,"rows":R,"option":"none"}`; SESSION 0 = new, N = re-attach |
+| 13 OPEN_RESP | in | `{"code":0,...}`; the session id is the header SESSION if non-zero, else `session_id` (number or string) in the body, else 0 (the official Windows host serves one terminal as session 0) |
+| 2 STDIN | out | raw bytes, ≤ 16 KiB per frame |
+| 3 RESIZE | out | `{"cols":C,"rows":R}` |
+| 4 CLOSE | out | empty; detaches (the remote session keeps running) |
+| 5 STDOUT | in | raw bytes |
+| 6 EXIT | in | `{"exit_code":N}` (missing = -1) |
+| 8 ERROR | in | the session failed |
+| 9 / 10 LIST_REQ / LIST_RESP | out / in | request SESSION = a counter from 1; answer is a bare JSON array of `{session_id, shell, state, ...}` |
+| 11 / 12 KILL_REQ / KILL_RESP | out / in | `{"code":0}` = killed |
+
+- First an environment check: `envelope(id, 21, {1: {1: id}, 28: ""})` on CONTROL (`id` counts from
+  10). The answer `{22: {1: {1: id}, 24: {1: code}}}` comes on CONTROL, or on BINARY without the TERM
+  magic (official Mac host). code ≠ 0 → exit 6. No answer within 3 s means the host does not
+  implement the check (official Windows host) and is not an error.
+- Other requests wait up to 30 s (timeout → exit 6). Re-attaching to SESSION first checks it is in
+  LIST_RESP (missing → exit 6). OPEN_RESP code ≠ 0 → exit 6.
+- STDOUT / EXIT / ERROR for other sessions are ignored. Output is copied to stdout unchanged.
+- Attach: with stdin a tty, enter raw mode, send the initial window size, forward SIGWINCH resizes.
+  With stdin not a tty there is no raw mode and no escape processing; stdin is forwarded as-is and
+  EOF detaches like `~.`.
+- Escape sequences (like ssh), only at the start of a line (after CR or LF, or first input): `~.`
+  detach, `~?` help (stderr), `~~` sends `~`; `~` followed by anything else sends both. `-e CHAR`
+  changes the escape char (one printable ASCII character), `-e none` disables it.
+- CLOSE is always sent when uucli leaves the session. Remote exit code N ≠ 0 → uucli exits 6 and
+  prints the code on stderr; exit 0 → uucli exits 0; detach → exit 0 and `Detached from terminal
+  session N` on stderr.
+- Raw mode is restored on every exit path; SIGTERM ends the attach like a detach (exit 0). Ctrl-C
+  is a byte for the remote side in raw mode.
+- `--list`: columns ID, NAME (`shell`), STATE, sorted by id; `--json` gives
+  `[{"id","name","state"}]`. `--kill SESSION` prints `Killed terminal session N` on stderr.
 
 ### 11.2 Files (M4)
 
-- `ls` prints one entry per line: kind, size, name; `--json` prints `[{kind, name, size, path}]`.
-- `get` / `put` transfer a single regular file. No recursion, no resume.
-- Destination exists → exit 2 unless `--force`.
-- Remote paths are passed through untouched (no Windows/Unix conversion).
-- Data is written to `DEST.uucli-part` and renamed on success; on failure the partial file is removed.
-- Progress on stderr (bytes, rate, ETA) only when stderr is a tty.
-- Ctrl-C cancels the transfer, notifies the host, and exits 130.
+Upstream: `src/viewer/tools/files.rs`, host side `src/file_trans.rs`. Session capture type 5.
+
+uucli's requests are `rpc(rid, request, CASE, BODY)` (§6.5 `rpc`, field 8) on CONTROL; the answer is
+the rpc response with the same `rid` whose field 4 holds the expected case. Replies arrive on FILE or
+CONTROL. `ID(task, index)` is field `1: {1: task, 2: index}`. Request ids and task ids share one
+counter starting at 100. Result codes: 1 = success, anything else → exit 6 with the code
+(`FT_*`: 4 permission, 5 disk, 6 I/O, 7 canceled, 9 not found). Each reply is awaited ≤ 30 s.
+
+| Operation | Request (case: body) | Response (case: fields) |
+| --- | --- | --- |
+| list | 10: `ID(t,0)`, 2 path | 7: 4 code, 3 rows (repeated) or 5 zlib(`{1: row}`...) |
+| upload request | 1: `ID(t,0)`, 2 dir, 3 info, 4 = 1, 6 zlib(`{1: info}`), 7 unique id (UUID text) | 1: 3 code |
+| upload open | 3: `ID(t,1)`, 3 size | 3: 3 code; 2 and 4 must be 0 (no skip / resume) |
+| upload block | 4: `ID(t,1)`, 2 block (from 0), 3 bytes (32 KiB) | 4: 3 code, 2 block, 4 length (must match) |
+| upload finish | 9: `ID(t,1)`, 2 = 1 | 6: 2 code |
+| download request | 2: `ID(t,0)`, 2 remote path | 2: 2 code, 3 file rows or 5 zlib, 4 folder name (non-empty = folder → exit 6) |
+
+- Row: `{1 kind, 2 name, 3 size, 4 modified (unix s), 5 full path}`; kind 0 dir, 3 drive, 4 file.
+  Upload info: `{1 name, 2 size, 3 modified}`. Inflated lists are limited to 16 MiB.
+- The remote target of `put` is split at the last `/` or `\` into directory and name, keeping the
+  host's separator; `/x` → `/`, `C:\x` → `C:\`, a bare name → `~/`. The name and a downloaded file's
+  relative path must be plain components (no `..`, no drive, not absolute).
+- Download is driven by the host after the request is accepted: it sends rpc requests (field 8) on
+  FILE/CONTROL, uucli answers each with an rpc response on CONTROL:
+  - 3 open `ID(t,1)`, 3 size → 3: `ID`, 3 code (size must match the list; only index 1).
+  - 4 block `ID(t,1)`, 2 block, 3 bytes (≤ 256 KiB) → 4: `ID`, 2 block, 3 code, 4 length. Blocks may
+    arrive out of order; up to 32 are buffered. The first block id is 0 (our host) or 1 (official
+    Windows host): the base is fixed when block 0 arrives or 16 blocks are buffered.
+  - 9 finish `ID(t,1)`, 2 status → 6: `ID`, 2 code (status 1, all bytes written).
+  - 9 with index 2^64−1 ends the task: status must be 1 and the file complete.
+- `put` without `--force` lists the remote directory first and refuses an existing name (exit 2).
+  `get` without `--force` refuses an existing LOCAL before connecting (exit 2).
+- `get` writes `LOCAL.uucli-part` and renames it on success; on failure the partial file is removed.
+- Failed or canceled upload: send request 9 `ID(t,1)`, 2 = 7 without waiting. Failed or canceled
+  download: for up to 3 s answer the host's outstanding requests of the task with code 7
+  (open → 3 field 3, block → 4 field 3, finish → 6 field 2).
+- Ctrl-C / SIGTERM: the session stays up while the tool cancels as above, then uucli exits 130 / 0.
+- Progress on stderr (`DONE/TOTAL bytes  RATE KiB/s  ETA Ns`, every 250 ms) only when stderr is a tty.
+- `ls` prints `KIND SIZE NAME` per line (kind `dir`, `drive`, `file`, `other`); `--json` prints
+  `[{"kind","name","size","path"}]` with the same kind names.
 
 ### 11.3 Packaging (M5)
 
-- Release archives for Linux x86_64 / aarch64 and macOS aarch64 / x86_64, statically linked.
-- `contrib/systemd/uucli-portmap@.service` (user unit) running a long-lived `portmap`.
-- README in English with install, login, ssh config and systemd examples.
+- `zig build release` builds ReleaseSafe, stripped binaries for x86_64 / aarch64 Linux (musl, fully
+  static) and x86_64 / aarch64 macOS (libSystem only) and writes
+  `zig-out/release/uucli-VERSION-ARCH-OS.tar.gz`, each with `uucli`, README, LICENSE, NOTICE and the
+  systemd unit. The macOS targets need a macOS host with the SDK (usrsctp uses SDK-only headers).
+- `contrib/systemd/uucli-portmap@.service`: user unit; instance `NAME` reads
+  `~/.config/uucli/portmap-NAME.env` (`UUCLI_DEVICE`, `UUCLI_FORWARDS`), restarts on failure after
+  30 s. Reconnects while the host is away are uucli's own (§7.1); SIGTERM stops it with exit 0.
+- README in English with build, login, ssh config, terminal, files and systemd examples.
 
 ## 12. Milestones and acceptance
 
@@ -565,7 +668,8 @@ Mac host compatibility (filled in as milestones complete):
 | Does the official host require a non-empty FeatureFlag (field 11) for tool sessions? | M2 | Upstream clears it for tools and only sends it for desktop. |
 | Does the Mac host support capture types 8 / 9 at all? | M2 / M3 | Upstream has not verified it. |
 | Does libdatachannel produce candidates/SDP the host accepts (vs webrtc-rs upstream)? | M2 | Watch `sdpMid`, `ice-options`, DTLS role. |
-| Which `std.Io` implementation to use with libdatachannel callbacks? | M0 | |
+| What does the API answer for bad requests? | M1 | Observed: wrong signature → HTTP 400 code 1003; `gen/login` without a registered `x-param-device-id` → HTTP 422 code 1001 ("无效的请求参数"). |
+| Which `std.Io` implementation to use with libdatachannel callbacks? | M0 | Closed: `std.Io.Threaded`; foreign-thread `Io.Queue` puts work (loopback self test, 60/60 runs on macOS, Linux x86_64 and aarch64). |
 
 Upstream drift log (append when the pin moves):
 

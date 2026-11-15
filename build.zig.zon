@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+.{
+    .name = .uucli,
+    .version = "0.0.1",
+    .fingerprint = 0x1c4640224d95be2d,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .libdatachannel = .{
+            .url = "https://github.com/paullouisageneau/libdatachannel/archive/refs/tags/v0.24.6.tar.gz",
+            .hash = "N-V-__8AAH7wNwObI9EjtWHx-gKAmR5w9n6GoPvQFTAtlm1v",
+            .lazy = true,
+        },
+        .libjuice = .{
+            .url = "https://github.com/paullouisageneau/libjuice/archive/b89c792e3612faf2f12cf35bcc56857313a06be3.tar.gz",
+            .hash = "N-V-__8AAB1oCADtUFeRxdCYQdecv0OSYjlKIfD-86Bh5JuF",
+            .lazy = true,
+        },
+        .usrsctp = .{
+            .url = "https://github.com/paullouisageneau/usrsctp/archive/fec583d54493f879d2ae44a743423bf8a04371ab.tar.gz",
+            .hash = "N-V-__8AALAGWACeA2U3iSwHwHdWNrq6RB1I8N80fRDQYjrw",
+            .lazy = true,
+        },
+        .plog = .{
+            .url = "https://github.com/SergiusTheBest/plog/archive/94899e0b926ac1b0f4750bfbd495167b4a6ae9ef.tar.gz",
+            .hash = "N-V-__8AAHtdDQDis4xbVP81BKAWxzs139lkmIgHT9HpIdfP",
+            .lazy = true,
+        },
+        .mbedtls = .{
+            .url = "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-3.6.6.tar.gz",
+            .hash = "N-V-__8AAI1FmQLj92go7nR7_J6kwr-7uYyuitngGqydvWkd",
+            .lazy = true,
+        },
+        .qrcodegen = .{
+            .url = "https://github.com/nayuki/QR-Code-generator/archive/refs/tags/v1.8.0.tar.gz",
+            .hash = "N-V-__8AAAUNCgASJ_dmT6fMkp5FaScvuePW99OrKCHaieoN",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "vendor", "LICENSE", "NOTICE" },
+}

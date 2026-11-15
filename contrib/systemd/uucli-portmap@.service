@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Keeps a uucli port mapping alive (user unit). The instance name selects an environment file:
+#
+#   mkdir -p ~/.config/uucli
+#   cat > ~/.config/uucli/portmap-office.env <<'X'
+#   UUCLI_DEVICE=office-pc
+#   UUCLI_FORWARDS=-L 2222:127.0.0.1:22
+#   X
+#   cp uucli-portmap@.service ~/.config/systemd/user/
+#   systemctl --user enable --now uucli-portmap@office
+#   loginctl enable-linger "$USER"     # keep it running without a login session
+#
+# Run `uucli login` once as the same user first. uucli reconnects by itself while the host is
+# offline or rebooting; systemd only restarts it after an exit (e.g. login expired: exit 3).
+[Unit]
+Description=uucli port mapping %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=%h/.config/uucli/portmap-%i.env
+ExecStart=/usr/local/bin/uucli portmap ${UUCLI_DEVICE} $UUCLI_FORWARDS
+Restart=on-failure
+RestartSec=30
+# SIGTERM ends portmap with exit code 0.
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
