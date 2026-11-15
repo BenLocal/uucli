@@ -674,6 +674,7 @@ fn runToolSession(
     };
     var task = try app.io.concurrent(Ctx.run, .{ app, tool_state, &bus });
     const end = s.run(tool_state.tool()) catch .interrupted;
+    // Optional hooks must be `pub`: @hasDecl does not see private declarations.
     if (end == .interrupted and @hasDecl(Tool, "interrupted")) {
         // The tool winds down on a live session (bounded by its own timeouts), then stops it.
         tool_state.interrupted();
@@ -710,7 +711,7 @@ const TerminalCmd = struct {
         c.t.post(.session_end);
     }
     /// SIGTERM (or SIGINT without raw mode): detach cleanly while the session is still up.
-    fn interrupted(c: *TerminalCmd) void {
+    pub fn interrupted(c: *TerminalCmd) void {
         c.t.post(.input_end);
     }
 };
@@ -993,7 +994,7 @@ const FilesCmd = struct {
     fn sessionEnded(c: *FilesCmd) void {
         c.f.post(.session_end);
     }
-    fn interrupted(c: *FilesCmd) void {
+    pub fn interrupted(c: *FilesCmd) void {
         c.f.post(.cancel);
     }
 };
@@ -1130,6 +1131,12 @@ test {
     _ = interrupts;
     _ = @import("e2e_test.zig");
     _ = @import("vectors_test.zig");
+}
+
+test "tool hooks are visible to runToolSession" {
+    // A private hook is silently skipped (@hasDecl only sees `pub` declarations).
+    try std.testing.expect(@hasDecl(TerminalCmd, "interrupted"));
+    try std.testing.expect(@hasDecl(FilesCmd, "interrupted"));
 }
 
 test "short forms" {
