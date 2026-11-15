@@ -284,6 +284,9 @@ pub const Session = struct {
     pub fn close(s: *Session) void {
         s.closing.store(true, .release);
         if (s.peer) |p| p.close();
+        // Cancel alone can miss a reader that is just entering its blocking read (seen with
+        // std.Io.Threaded on macOS: close hung forever); shutting down the read side ends it.
+        s.sig.interrupt();
         if (s.reader) |*r| r.cancel(s.io);
         s.sig.close();
         for (s.pending.items) |p| p.deinit();
@@ -314,7 +317,7 @@ pub const Session = struct {
     fn readerTask(s: *Session) void {
         while (true) {
             const p = s.sig.next() catch |err| {
-                if (err != error.Canceled) {
+                if (err != error.Canceled and !s.closing.load(.acquire)) {
                     log.info("signaling ended: {t}", .{err});
                     s.bus.put(.{ .signal_end = .{ .gen = s.gen } });
                 }
