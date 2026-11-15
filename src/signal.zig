@@ -209,6 +209,11 @@ pub const Signal = struct {
         s.socket.deinit();
     }
 
+    /// Makes a task blocked in `next` return; `close` still has to follow.
+    pub fn interrupt(s: *Signal) void {
+        s.socket.shutdownRead();
+    }
+
     fn pong(s: *Signal, suffix: []const u8) !void {
         var buf: [64]u8 = undefined;
         const reply = std.fmt.bufPrint(&buf, "3{s}", .{suffix}) catch "3";

@@ -92,6 +92,11 @@ pub const Socket = struct {
         return .{ .io = io, .http = http, .conn = conn };
     }
 
+    /// Makes a task blocked in `receive` return with an error; `deinit` still has to follow.
+    pub fn shutdownRead(s: *Socket) void {
+        s.conn.stream_reader.stream.shutdown(s.io, .recv) catch {};
+    }
+
     /// Closes the TCP/TLS connection (after a best-effort close frame).
     pub fn deinit(s: *Socket) void {
         if (!s.closed) s.send(.close, &.{ 0x03, 0xe8 }) catch {};
