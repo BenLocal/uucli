@@ -77,6 +77,18 @@ Like ssh, `~.` at the start of a line detaches (the remote session keeps running
 and `~~` sends a `~`. `-e CHAR` changes the escape character, `-e none` turns it off. A remote
 exit code other than 0 makes uucli exit 6.
 
+## Run one command
+
+```sh
+uucli exec office-pc 'Get-Service sshd'          # output on stdout, remote exit code as uucli's
+uucli x -j office-pc -- hostname                 # {"exit_code":0,"output":"..."}
+uucli x -t 30 office-pc 'cmd /c exit 7'; echo $? # 7
+```
+
+The command runs in a new remote terminal: PowerShell on Windows hosts, sh elsewhere. stdout and
+stderr arrive merged. `--timeout` (default 300 s, 0 = none) sends Ctrl-C and exits 6 when it runs
+out. Since the exit code is the remote one, codes 1..6 can come from either side; stderr says which.
+
 ## Files
 
 ```sh
@@ -100,6 +112,7 @@ uucli fs office-pc ls 'C:\Users\me' -j
 uucli fs office-pc get 'C:\Users\me\a.zip' a.zip -f
 uucli pm office-pc -L 2222:127.0.0.1:22 -n
 uucli px office-pc 127.0.0.1 22
+uucli x -t 60 office-pc hostname    # exec office-pc --timeout 60 hostname
 ```
 
 `login` and `logout` have none.

@@ -485,10 +485,13 @@ pub fn execLine(gpa: Allocator, shell: Shell, nonce: []const u8, command: []cons
             const b64 = try gpa.alloc(u8, enc.calcSize(command.len));
             defer gpa.free(b64);
             _ = enc.encode(b64, command);
-            try out.print(gpa, "$global:LASTEXITCODE=0; Write-Output ('UU'+'CLI-S-{s}'); " ++
-                "try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{s}'))); $o=$? }} " ++
-                "catch {{ $_; $o=$false }}; $u=if ($LASTEXITCODE) {{ $LASTEXITCODE }} elseif ($o) {{ 0 }} else {{ 1 }}; " ++
-                "Write-Output ('UU'+'CLI-E-{s}:'+$u); exit $u\r", .{ nonce, b64, nonce });
+            // No `exit`: the official Windows host ends the terminal when uucli disconnects, and a
+            // shell that exits right away can lose its last screen update (output and end marker).
+            // `$?` after Invoke-Expression does not reflect a failing cmdlet inside it; `$Error` does.
+            try out.print(gpa, "$global:LASTEXITCODE=0; $Error.Clear(); Write-Output ('UU'+'CLI-S-{s}'); " ++
+                "try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{s}'))) }} " ++
+                "catch {{ $_ }}; $u=if ($LASTEXITCODE) {{ $LASTEXITCODE }} elseif ($Error.Count) {{ 1 }} else {{ 0 }}; " ++
+                "Write-Output ('UU'+'CLI-E-{s}:'+$u)\r", .{ nonce, b64, nonce });
         },
         .posix => {
             try out.print(gpa, "printf '%s\\n' \"UU\"\"CLI-S-{s}\"; eval '", .{nonce});
@@ -508,12 +511,28 @@ pub fn extract(text: []const u8, nonce: []const u8) ?ExecOutput {
     const nl = std.mem.indexOfScalarPos(u8, text, e + end.len, '\n') orelse return null;
     const code = std.fmt.parseInt(i64, std.mem.trim(u8, text[e + end.len .. nl], " \t"), 10) catch return null;
     const out_end = if (std.mem.lastIndexOfScalar(u8, text[body..e], '\n')) |i| body + i + 1 else body;
-    return .{ .output = text[body..out_end], .code = code };
+    return .{ .output = trimBlankLines(text[body..out_end]), .code = code };
+}
+
+/// Drops whitespace-only lines at both ends (cursor jumps leave some before and after output).
+fn trimBlankLines(out: []const u8) []const u8 {
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, out, start, '\n')) |nl| {
+        if (std.mem.trim(u8, out[start..nl], " \t").len != 0) break;
+        start = nl + 1;
+    }
+    var end = out.len;
+    while (end > start) {
+        const prev = if (std.mem.lastIndexOfScalar(u8, out[start .. end - 1], '\n')) |i| start + i + 1 else start;
+        if (std.mem.trim(u8, out[prev .. end - 1], " \t").len != 0) break;
+        end = prev;
+    }
+    return out[start..end];
 }
 
 /// Text after the start marker's line (all of it when the marker never came).
 fn afterStart(text: []const u8, nonce: []const u8) []const u8 {
-    return text[bodyStart(text, nonce) orelse return text..];
+    return text[bodyStart(text, nonce) orelse return text ..];
 }
 
 fn bodyStart(text: []const u8, nonce: []const u8) ?usize {
@@ -523,33 +542,64 @@ fn bodyStart(text: []const u8, nonce: []const u8) ?usize {
     return (std.mem.indexOfScalarPos(u8, text, s + start.len, '\n') orelse return null) + 1;
 }
 
-/// Turns host terminal output into plain text for `exec`: drops CSI, OSC and two-byte escape
-/// sequences, CR and other control characters. `ESC [ n C` (cursor forward), which ConPTY sends
-/// for runs of spaces, becomes n spaces. Screen redraws are not interpreted.
+/// Turns host terminal output into plain text for `exec`: drops OSC and two-byte escape sequences,
+/// CR and other control characters, and maps cursor movement to text. ConPTY (official Windows
+/// host) sends runs of spaces as `ESC [ n C` and often starts lines with cursor positioning
+/// (`ESC [ row ; col H`) instead of CR LF, so the stripper tracks the cursor: a move to a later row
+/// becomes line breaks plus indent, a move right on the same row becomes spaces, any other move
+/// starts a new line. Full-screen redraws are not interpreted.
 pub const Stripper = struct {
     state: enum { text, esc, csi, osc, osc_esc } = .text,
-    param: u32 = 0,
+    params: [2]u32 = .{ 0, 0 },
+    nparams: u8 = 0,
+    row: u32 = 1,
+    col: u32 = 1,
 
     pub fn feed(s: *Stripper, gpa: Allocator, out: *std.ArrayList(u8), data: []const u8) Allocator.Error!void {
         for (data) |b| switch (s.state) {
             .text => switch (b) {
                 0x1b => s.state = .esc,
-                '\n', '\t' => try out.append(gpa, b),
-                else => if (b >= 0x20 and b != 0x7f) try out.append(gpa, b),
+                '\n' => {
+                    try out.append(gpa, '\n');
+                    s.row += 1;
+                    s.col = 1;
+                },
+                '\r' => s.col = 1,
+                '\t' => {
+                    try out.append(gpa, '\t');
+                    s.col += 1;
+                },
+                else => if (b >= 0x20 and b != 0x7f) {
+                    try out.append(gpa, b);
+                    // One column per character: count UTF-8 lead bytes only.
+                    if (b & 0xc0 != 0x80) s.col += 1;
+                },
             },
             .esc => switch (b) {
                 '[' => {
                     s.state = .csi;
-                    s.param = 0;
+                    s.params = .{ 0, 0 };
+                    s.nparams = 1;
                 },
                 ']' => s.state = .osc,
                 else => s.state = .text,
             },
             .csi => switch (b) {
-                '0'...'9' => s.param = s.param *| 10 +| (b - '0'),
-                ';' => s.param = 0,
+                '0'...'9' => {
+                    const p = &s.params[@min(s.nparams, 2) - 1];
+                    p.* = p.* *| 10 +| (b - '0');
+                },
+                ';' => s.nparams +|= 1,
                 0x40...0x7e => {
-                    if (b == 'C') try out.appendNTimes(gpa, ' ', @min(@max(s.param, 1), 1000));
+                    const n1 = @max(s.params[0], 1);
+                    const n2 = @max(s.params[1], 1);
+                    switch (b) {
+                        'C' => try s.moveTo(gpa, out, s.row, s.col +| n1),
+                        'H', 'f' => try s.moveTo(gpa, out, n1, if (s.nparams >= 2) n2 else 1),
+                        'G' => try s.moveTo(gpa, out, s.row, n1),
+                        'd' => try s.moveTo(gpa, out, n1, s.col),
+                        else => {},
+                    }
                     s.state = .text;
                 },
                 else => {},
@@ -561,6 +611,18 @@ pub const Stripper = struct {
             },
             .osc_esc => s.state = if (b == '\\') .text else .osc,
         };
+    }
+
+    fn moveTo(s: *Stripper, gpa: Allocator, out: *std.ArrayList(u8), row: u32, col: u32) Allocator.Error!void {
+        if (row == s.row and col >= s.col) {
+            try out.appendNTimes(gpa, ' ', @min(col - s.col, 1000));
+        } else {
+            const lines = if (row > s.row) @min(row - s.row, 100) else 1;
+            try out.appendNTimes(gpa, '\n', lines);
+            try out.appendNTimes(gpa, ' ', @min(col -| 1, 1000));
+        }
+        s.row = row;
+        s.col = col;
     }
 };
 
@@ -692,6 +754,22 @@ test "exec: strip ConPTY output and extract the result" {
     // The end marker line must be complete.
     try testing.expect(extract("UUCLI-S-0123abcd\nx\nUUCLI-E-0123abcd:1", nonce) == null);
     try testing.expectEqualStrings("x\n", afterStart("echo\nUUCLI-S-0123abcd\nx\n", nonce));
+    try testing.expectEqualStrings("a\n\n b\n", trimBlankLines("\n  \na\n\n b\n \n\n"));
+    try testing.expectEqualStrings("", trimBlankLines("\n\n"));
+}
+
+test "exec: cursor positioning instead of CR LF" {
+    const gpa = testing.allocator;
+    // Captured from the official Windows host (user name replaced): a table drawn with ESC[row;colH.
+    const raw = "UUCLI-S-0f1d96d3d6c3a63c\x1b[?25l\x1b[6;1H\x1b[?25h\x1b[?25l\x1b[1CStatus\x1b[1CName\x1b[7;2H------\x1b[1C----\r\n" ++
+        "Running\x1b[1Csshd\r\nUUCLI-E-0f1d96d3d6c3a63c:0\x1b[12;1HPS\x1b[1CC:\\Users\\me>\x1b[1C\x1b[?25h";
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var s: Stripper = .{ .row = 5 };
+    try s.feed(gpa, &text, raw);
+    const r = extract(text.items, "0f1d96d3d6c3a63c").?;
+    try testing.expectEqualStrings(" Status Name\n ------ ----\nRunning sshd\n", r.output);
+    try testing.expectEqual(@as(i64, 0), r.code);
 }
 
 test "exec: wrapper lines" {
@@ -700,7 +778,7 @@ test "exec: wrapper lines" {
     defer gpa.free(ps);
     try testing.expect(std.mem.indexOf(u8, ps, "UUCLI-") == null);
     try testing.expect(std.mem.indexOf(u8, ps, "FromBase64String('R2V0LVNlcnZpY2UgJ3NzaGQn')") != null);
-    try testing.expect(std.mem.endsWith(u8, ps, "exit $u\r"));
+    try testing.expect(std.mem.endsWith(u8, ps, "+$u)\r"));
     const sh = try execLine(gpa, .posix, "n1", "echo 'a b'");
     defer gpa.free(sh);
     try testing.expect(std.mem.indexOf(u8, sh, "UUCLI-") == null);

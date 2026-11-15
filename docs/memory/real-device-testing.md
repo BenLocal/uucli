@@ -11,3 +11,5 @@
 - 2026-11-15 远程终端的输出是 ConPTY 屏幕流，夹着大量 ANSI 控制序列；用管道喂命令时要先 `sleep` 等提示符、命令以 `\r` 结尾，结果需要剥掉 ANSI 再找，建议在命令输出里打一个独特前缀（如 `MARK:`）再 grep。
 - 2026-11-15 Windows 被控端上 `px` / `portmap` 能用：`ssh -o ProxyCommand='uucli px DEVICE 127.0.0.1 22' …` 完成密钥交换并走到认证阶段（被控端装有 Windows OpenSSH sshd）。前提同终端：被控端已解锁、没有其他主控端连着；否则会在会话就绪前失败（`control request refused by the host` 或 `signaling ended: RoomClosed`）。
 - 2026-11-15 会话就绪前失败时 uucli 曾 double free 并 panic（`src/session.zig` 的 arena 被 `errdefer arena.deinit()` 和 `errdefer s.close()` 各释放一次）→ 已修，回归测试是 `src/e2e_test.zig` 的 "session open fails cleanly after the session exists"。看到 `SafeAllocator … in free … session.zig` 的栈，先确认装的是修复后的二进制。
+- 2026-11-15 Windows 被控端的 ConPTY 输出常用 `ESC[row;colH` 定位光标代替 CR LF、用 `ESC[nC` 代替空格；只剥 ANSI 会把表格的多行粘成一行、找不到结束标记 → `exec` 的 Stripper 按行列跟踪光标（`src/tools/terminal.zig`）。实测 `Get-Service … | Select-Object` 的表格输出靠这个才正确。
+- 2026-11-15 Windows 被控端上 shell 一执行完就 `exit`，最后一屏更新会丢（`Format-Table` 输出和结束标记都没到）→ PowerShell 包装行不带 `exit`，uucli 收到结束标记后自己关会话。佐证：同一命令去掉 `exit` 后连续多次都拿到完整输出。

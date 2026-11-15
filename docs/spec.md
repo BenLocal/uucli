@@ -78,6 +78,7 @@ No fuzzy or prefix matching.
 | `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). |
 | `uucli terminal DEVICE --list [--json]` | M3 | Lists remote terminal sessions. |
 | `uucli terminal DEVICE --kill SESSION` | M3 | Ends a remote terminal session. |
+| `uucli exec DEVICE [--timeout SECONDS] [--json] [--] COMMAND...` | M3 | Runs one command in a new remote terminal and prints its output (§11.1.1). Exits with the remote exit code. |
 | `uucli files DEVICE ls REMOTE_DIR [--json]` | M4 | Lists one remote directory. |
 | `uucli files DEVICE get REMOTE LOCAL [--force]` | M4 | Downloads one file. |
 | `uucli files DEVICE put LOCAL REMOTE [--force]` | M4 | Uploads one file. |
@@ -96,11 +97,13 @@ command never changes what an existing abbreviation means.
 | `px` | `proxy` |
 | `term` | `terminal` |
 | `fs` | `files` |
+| `x` | `exec` |
 | `-j` | `--json` |
 | `-l` | `--list` |
 | `-k` | `--kill` |
 | `-f` | `--force` |
 | `-n` | `--no-reconnect` |
+| `-t` | `--timeout` |
 
 `login` and `logout` have no short form: login is an interactive QR flow, and logout drops the
 account, so neither should be typed by accident.
@@ -607,6 +610,33 @@ fails the terminal).
 - `--list`: columns ID, NAME (`shell`), STATE, sorted by id; `--json` gives
   `[{"id","name","state"}]`. `--kill SESSION` prints `Killed terminal session N` on stderr.
 
+#### 11.1.1 `exec`
+
+`exec` is for scripts and agents: one command, its output on stdout, its exit code as uucli's.
+
+- Options come before COMMAND; `--` ends them. The remaining words are joined with single spaces
+  and run by the remote shell, so quote for that shell. COMMAND is at most 8 KiB.
+- Opens a new terminal (200×50, so lines rarely wrap), waits for the prompt, then sends one input
+  line that prints a start marker `UUCLI-S-NONCE`, runs COMMAND, and prints an end marker
+  `UUCLI-E-NONCE:CODE`. NONCE is 16 random hex digits. Each marker is built by string concatenation
+  (`'UU'+'CLI-S-…'`), so the echoed input line never contains it.
+- Shell by the device platform from the device list: `windows` → PowerShell, everything else →
+  POSIX sh.
+  - PowerShell: COMMAND is base64 (UTF-8) and run with `Invoke-Expression` inside `try`. CODE is
+    `$LASTEXITCODE` if non-zero, else 1 if `$Error` has entries (a failed cmdlet), else 0. The line
+    does not end with `exit`: on the official Windows host, a shell that exits at once loses its
+    last screen update, end marker included.
+  - POSIX: `eval` of COMMAND in single quotes, then `exit CODE`.
+- Output is the terminal screen stream, so stdout and stderr are merged. ANSI sequences are
+  stripped; ConPTY cursor moves (`ESC[nC`, `ESC[row;colH`, `G`, `d`) become spaces and newlines.
+  Blank lines at the start and end are dropped. More than 16 MiB → exit 6.
+- `--timeout SECONDS` (default 300, 0 = none): past it, uucli sends Ctrl-C and exits 6. SIGINT /
+  SIGTERM also send Ctrl-C and end the run.
+- Exit code: the remote CODE if 0..255 (so 1..6 can come from either side; stderr says which), else
+  1. With `--json` stdout is `{"exit_code":N,"output":"..."}`.
+- Limits: a COMMAND that itself runs `exit` ends the shell before the end marker (output may be
+  lost); a PowerShell parse error shows part of the wrapper line.
+
 ### 11.2 Files (M4)
 
 Upstream: `src/viewer/tools/files.rs`, host side `src/file_trans.rs`. Session capture type 5.
@@ -697,6 +727,7 @@ Real-device log:
 | 2026-11-15 | Windows host unlock from uucli | no answer to either guess: SimpleAction 15 `AUTO_UNLOCK_SYSTEM` with `{"key": …}` on CONTROL (upstream Linux host format), or TERM `UNLOCK_REQ` (14) with `{"password": …}`. How the official Windows host takes the system password is unknown |
 | 2026-11-15 | Windows host `terminal` open, host unlocked, no other controller | passed: OPEN accepted, PowerShell ran a command and printed its output; detach ends the session (one terminal per connection). No password was sent |
 | 2026-11-15 | Windows host `proxy` as ssh `ProxyCommand` to `127.0.0.1:22` | passed up to authentication: SYN-ACK ok, SSH key exchange with the host's OpenSSH sshd completed. Login, `scp` and the reconnect check of M2 not run yet. Before this run, a setup failure (host refusing the control request) panicked with a double free in `Session.open`; fixed in `cdd540d` |
+| 2026-11-15 | Windows host `exec` (PowerShell) | passed: plain output, table output (ConPTY cursor positioning), native exit code 3, failing cmdlet → 1 with its error text, parse error → 1, quotes, `--json`. One `exec` per connection, like `terminal` |
 | 2026-11-15 | Windows host `files ls` | no answer within 30 s after session ready (same as the Mac host) |
 
 ## 13. Open questions and protocol drift

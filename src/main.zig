@@ -782,10 +782,10 @@ const ExecCmd = struct {
     /// Set once the command's result is in.
     done: std.atomic.Value(bool) = .init(false),
 
-    fn completed(c: *ExecCmd) bool {
+    pub fn completed(c: *ExecCmd) bool {
         return c.done.load(.acquire);
     }
-    fn device(c: *ExecCmd, d: api.Device) void {
+    pub fn device(c: *ExecCmd, d: api.Device) void {
         // The official Windows host runs PowerShell; other hosts run a POSIX shell.
         c.shell = if (d.platform == .windows) .powershell else .posix;
     }
@@ -801,7 +801,7 @@ const ExecCmd = struct {
     fn sessionEnded(c: *ExecCmd) void {
         c.t.post(.session_end);
     }
-    fn interrupted(c: *ExecCmd) void {
+    pub fn interrupted(c: *ExecCmd) void {
         c.t.post(.input_end);
     }
 };
@@ -856,8 +856,8 @@ fn execWorker(app: *App, cmd: *ExecCmd) Exit {
         error.Rejected => app.fail(.remote, "the terminal environment is unavailable on the device", .{}),
         else => terminalError(app, err),
     };
-    // Wide, so the shell does not wrap output lines.
-    const id = t.open(app.arena, 0, 1000, 50) catch |err| return terminalError(app, err);
+    // Wide, so the shell rarely wraps output lines.
+    const id = t.open(app.arena, 0, 200, 50) catch |err| return terminalError(app, err);
     defer t.close(id);
     var nonce_raw: [8]u8 = undefined;
     app.io.random(&nonce_raw);
@@ -1137,6 +1137,9 @@ test "tool hooks are visible to runToolSession" {
     // A private hook is silently skipped (@hasDecl only sees `pub` declarations).
     try std.testing.expect(@hasDecl(TerminalCmd, "interrupted"));
     try std.testing.expect(@hasDecl(FilesCmd, "interrupted"));
+    try std.testing.expect(@hasDecl(ExecCmd, "interrupted"));
+    try std.testing.expect(@hasDecl(ExecCmd, "completed"));
+    try std.testing.expect(@hasDecl(ExecCmd, "device"));
 }
 
 test "short forms" {
