@@ -82,7 +82,8 @@ is a share id, joined by code.
 | `uucli device list [--json]` | M1 | Lists account devices (§5.4). |
 | `uucli fav list [--recent] [--json]` | — | Lists the account's remote-assistance favorites, or with `--recent` the recently connected hosts (§5.5). Columns `ID NAME FAVORITE CODE`; `CODE` is `saved` when a code is in the config. JSON: `[{"id", "name", "favorite", "code_saved"}]`. |
 | `uucli fav add ID [NAME] [--save-code]` | — | Adds share `ID` to the favorites with remark `NAME` (§5.5). `--save-code` also stores its code in the config (§5.6). Adding an existing favorite again replaces its remark (verified 2026-11-16), so this also renames. |
-| `uucli fav rm NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
+| `uucli fav edit NAME\|ID [NEW_NAME] [--save-code]` | — | Changes a favorite (resolved like §3.3 step 4; exit 4 when absent): `NEW_NAME` re-adds it with that remark and its original `favorited_at`; `--save-code` replaces the code in the config. At least one of the two, else exit 2. |
+| `uucli fav rm\|remove NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
 | `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
 | `uucli proxy DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. Exits when either side closes. |
 | `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). |
@@ -792,6 +793,7 @@ Real-device log:
 | 2026-11-15 | Windows host `files ls` | no answer within 30 s after session ready (same as the Mac host) |
 | 2026-11-16 | Remote assistance by code to a Windows host of another account | room join (v2 path) passed; `exec hostname` printed the host name, exit 0, PowerShell chosen from `publisher_platform`. Without it the POSIX wrapper reached PowerShell, so tool sessions are allowed in assistance rooms |
 | 2026-11-16 | Same share id, same temporary code, a third join | HTTP 400 code 1131: the code had stopped working (used up or assistance turned off; not distinguished). `files` over assistance not tested yet |
+| 2026-11-16 | `fav edit` rename and rename back; `fav edit --save-code` on a copy of the config | passed: both lists showed each new remark; the code was saved with mode 0600 |
 | 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
 
 ## 13. Open questions and protocol drift

@@ -48,8 +48,10 @@ const usage_text =
     \\  logout                                  Forget the account (keeps the device identity)
     \\  device list [--json]                    List the account's devices
     \\  fav list [--recent] [--json]            List remote-assistance favorites (or recent hosts)
-    \\  fav add ID [NAME] [--save-code]         Add a share id to the favorites, or rename one
-    \\  fav rm NAME|ID                          Remove a favorite and its saved code
+    \\  fav add ID [NAME] [--save-code]         Add a share id to the favorites (optionally save its code)
+    \\  fav edit NAME|ID [NEW_NAME] [--save-code]
+    \\                                          Rename a favorite and/or replace its saved code
+    \\  fav rm|remove NAME|ID                   Remove a favorite and its saved code
     \\  portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]
     \\  proxy DEVICE HOST PORT                  Connect stdin/stdout to HOST:PORT (ssh ProxyCommand)
     \\  terminal DEVICE [SESSION] [-e CHAR|none] | --list [--json] | --kill SESSION
@@ -384,7 +386,7 @@ pub fn displayWidth(s: []const u8) usize {
 
 /// Remote-assistance favorites, stored on the account like the official apps' (spec §5.5).
 fn cmdFav(app: *App, args: []const [:0]const u8) !Exit {
-    const usage_fav = "expected `fav list [--recent] [--json] | add ID [NAME] [--save-code] | rm NAME|ID`";
+    const usage_fav = "expected `fav list [--recent] [--json] | add ID [NAME] [--save-code] | edit NAME|ID [NEW_NAME] [--save-code] | rm|remove NAME|ID`";
     if (args.len == 0) return usage(app, usage_fav, .{});
     const sub = args[0];
     var pos: std.ArrayList([]const u8) = .empty;
@@ -397,9 +399,12 @@ fn cmdFav(app: *App, args: []const [:0]const u8) !Exit {
     const p = pos.items;
     const is_list = eql(sub, "list") or eql(sub, "ls");
     const is_add = eql(sub, "add");
+    const is_edit = eql(sub, "edit");
     const is_rm = eql(sub, "rm") or eql(sub, "remove");
     if (!(is_list and p.len == 0 and !save_code) and
         !(is_add and p.len >= 1 and p.len <= 2 and !json and !recent) and
+        // edit changes the name, the saved code, or both.
+        !(is_edit and p.len >= 1 and p.len <= 2 and (p.len == 2 or save_code) and !json and !recent) and
         !(is_rm and p.len == 1 and !json and !recent and !save_code)) return usage(app, usage_fav, .{});
 
     var cfg: config.Config = undefined;
@@ -416,10 +421,7 @@ fn cmdFav(app: *App, args: []const [:0]const u8) !Exit {
         const id = p[0];
         const name = if (p.len == 2) p[1] else "";
         // Asked before the request, so a failed read changes nothing on the account.
-        const code: ?[]const u8 = if (save_code) blk: {
-            if (app.env.get("UUCLI_ASSIST_CODE")) |c| if (c.len != 0) break :blk c;
-            break :blk try readCode(app, id, true);
-        } else null;
+        const code = if (save_code) try codeToSave(app, id) else null;
         api.addFavorite(&client, app.arena, id, name, Io.Clock.real.now(app.io).toSeconds()) catch |err| return favCallError(app, "adding the favorite", &client, err);
         if (code) |c| try updateSavedCode(app, id, c);
         try app.err.print("Added favorite {s}{s}{s}{s}\n", .{ id, if (name.len != 0) " (" else "", name, if (name.len != 0) ")" else "" });
@@ -436,10 +438,30 @@ fn cmdFav(app: *App, args: []const [:0]const u8) !Exit {
             return .usage;
         },
     };
+    if (is_edit) {
+        const code = if (save_code) try codeToSave(app, f.id) else null;
+        if (p.len == 2) {
+            // Re-adding replaces the remark; the original time keeps the favorite's place in the apps.
+            const at = f.favorited_at orelse Io.Clock.real.now(app.io).toSeconds();
+            api.addFavorite(&client, app.arena, f.id, p[1], at) catch |err| return favCallError(app, "editing the favorite", &client, err);
+            try app.err.print("Renamed favorite {s} to {s}\n", .{ f.id, p[1] });
+        }
+        if (code) |c| {
+            try updateSavedCode(app, f.id, c);
+            try app.err.writeAll("The code is saved in the config file\n");
+        }
+        return .ok;
+    }
     api.removeSaved(&client, .favorites, f.publisher_device_id) catch |err| return favCallError(app, "removing the favorite", &client, err);
     if (cfg.assistCode(f.id) != null) try updateSavedCode(app, f.id, null);
     try app.err.print("Removed favorite {s} ({s})\n", .{ f.name, f.id });
     return .ok;
+}
+
+/// A code for `--save-code`: UUCLI_ASSIST_CODE, else asked for (never the one already saved).
+fn codeToSave(app: *App, id: []const u8) ![]const u8 {
+    if (app.env.get("UUCLI_ASSIST_CODE")) |c| if (c.len != 0) return c;
+    return readCode(app, id, true);
 }
 
 fn favCallError(app: *App, what: []const u8, client: *const api.Client, err: anyerror) anyerror!Exit {

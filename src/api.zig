@@ -497,6 +497,8 @@ pub const Saved = struct {
     /// Key of the DELETE call.
     publisher_device_id: []const u8,
     favorite: bool,
+    /// Seconds; null when not a favorite.
+    favorited_at: ?i64,
 };
 
 /// One page of `GET /api/v1/device/share/saved/{kind}`: `{saved: [...], next}`. Strings point into
@@ -512,6 +514,7 @@ pub fn parseSaved(arena: Allocator, data: std.json.Value) Allocator.Error!struct
             .name = if (remark.len != 0) remark else id,
             .publisher_device_id = str(e, "publisher_device_id") orelse "",
             .favorite = if (e.object.get("is_favorite")) |f| f == .bool and f.bool else false,
+            .favorited_at = int(e, "favorited_at"),
         });
     };
     const next: ?[]const u8 = if (data == .object) if (data.object.get("next")) |n| switch (n) {
@@ -542,6 +545,7 @@ pub fn listSaved(c: *Client, arena: Allocator, kind: SavedKind) (CallError || er
             .name = try arena.dupe(u8, s.name),
             .publisher_device_id = try arena.dupe(u8, s.publisher_device_id),
             .favorite = s.favorite,
+            .favorited_at = s.favorited_at,
         });
         cursor = if (page.next) |n| try arena.dupe(u8, n) else return all.items;
     }
@@ -549,10 +553,11 @@ pub fn listSaved(c: *Client, arena: Allocator, kind: SavedKind) (CallError || er
 }
 
 /// `POST /api/v1/device/share/saved/favorites` with one entry (the official Android app's
-/// `AssistFavoriteInput`). `now` is in seconds.
-pub fn addFavorite(c: *Client, arena: Allocator, id: []const u8, name: []const u8, now: i64) CallError!void {
+/// `AssistFavoriteInput`). For an existing favorite it replaces the remark. `favorited_at` is in
+/// seconds.
+pub fn addFavorite(c: *Client, arena: Allocator, id: []const u8, name: []const u8, favorited_at: i64) CallError!void {
     const body = try std.json.Stringify.valueAlloc(arena, .{
-        .favorites = .{.{ .connect_id = id, .remark = name, .favorited_at = now }},
+        .favorites = .{.{ .connect_id = id, .remark = name, .favorited_at = favorited_at }},
         .skip_invalid = false,
     }, .{});
     var resp = try c.call(.POST, "/api/v1/device/share/saved/favorites", body, .fromSeconds(15));
@@ -663,6 +668,8 @@ test "parseSaved and resolveSaved" {
     try testing.expectEqualStrings("Lab", page.items[0].name);
     try testing.expectEqualStrings("p1", page.items[0].publisher_device_id);
     try testing.expect(page.items[0].favorite and !page.items[1].favorite);
+    try testing.expectEqual(@as(?i64, 2), page.items[0].favorited_at);
+    try testing.expectEqual(@as(?i64, null), page.items[1].favorited_at);
     try testing.expectEqualStrings("222", page.items[1].name);
     try testing.expectEqualStrings("c2", page.next.?);
     const last = try std.json.parseFromSliceLeaky(std.json.Value, ar, "{\"saved\":[],\"next\":null}", .{});

@@ -115,10 +115,10 @@ Favorites are stored on your account, like in the official apps, and are reachab
 
 ```sh
 uucli fav add 123456789 lab-pc                # --save-code also stores the code in the config
-uucli fav add 123456789 lab-2                 # adding again renames
+uucli fav edit lab-pc lab-2                   # rename; --save-code replaces the saved code
 uucli fav list                                # ID NAME FAVORITE CODE; --recent for recent hosts
-uucli exec lab-pc -- hostname
-uucli fav rm lab-pc
+uucli exec lab-2 -- hostname
+uucli fav rm lab-2                            # or fav remove
 ```
 
 The code is read from `UUCLI_ASSIST_CODE`, then the config, then asked for on the terminal (or read
