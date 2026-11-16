@@ -16,6 +16,24 @@ pub const Config = struct {
     csrf: []const u8 = "",
     account_name: []const u8 = "",
     sign_key: []const u8 = "",
+    /// Remote-assistance codes saved with `fav add --save-code`, by share id.
+    assist_codes: []const AssistCode = &.{},
+
+    pub const AssistCode = struct { id: []const u8, code: []const u8 };
+
+    /// The saved code for share `id`.
+    pub fn assistCode(c: Config, id: []const u8) ?[]const u8 {
+        for (c.assist_codes) |a| if (std.mem.eql(u8, a.id, id)) return a.code;
+        return null;
+    }
+
+    /// Replaces (or with `code == null` removes) the saved code for `id`.
+    pub fn setAssistCode(c: *Config, arena: Allocator, id: []const u8, code: ?[]const u8) Allocator.Error!void {
+        var list: std.ArrayList(AssistCode) = .empty;
+        for (c.assist_codes) |a| if (!std.mem.eql(u8, a.id, id)) try list.append(arena, a);
+        if (code) |k| try list.append(arena, .{ .id = id, .code = k });
+        c.assist_codes = list.items;
+    }
 
     pub fn signedIn(c: Config) bool {
         return c.token.len != 0 and c.user_id.len != 0 and c.csrf.len != 0;
@@ -103,8 +121,8 @@ fn writeJson(w: *Io.Writer, cfg: Config) Io.Writer.Error!void {
     try s.beginObject();
     inline for (comptime std.meta.fieldNames(Config)) |name| {
         const v = @field(cfg, name);
-        // sign_key is an optional override; keep the file free of the default.
-        if (!(std.mem.eql(u8, name, "sign_key") and v.len == 0)) {
+        // sign_key is an optional override; keep the file free of the default. Same for the codes.
+        if (!(std.mem.eql(u8, name, "sign_key") and v.len == 0) and !(std.mem.eql(u8, name, "assist_codes") and v.len == 0)) {
             try s.objectField(name);
             try s.write(v);
         }
@@ -211,6 +229,32 @@ test "save then load round-trips with 0600 and rejects group-readable files" {
 
     try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o644), .{});
     try testing.expectError(error.InsecurePermissions, load(arena, io, path));
+}
+
+test "assistance codes are saved per share id and omitted when empty" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "config.json");
+
+    var cfg: Config = .{ .device_id = "d" };
+    try cfg.setAssistCode(arena, "111", "old");
+    try cfg.setAssistCode(arena, "222", "b");
+    try cfg.setAssistCode(arena, "111", "new");
+    try save(io, path, cfg);
+    var back = try load(arena, io, path);
+    try testing.expectEqualStrings("new", back.assistCode("111").?);
+    try testing.expectEqualStrings("b", back.assistCode("222").?);
+    try testing.expectEqual(@as(usize, 2), back.assist_codes.len);
+
+    try back.setAssistCode(arena, "111", null);
+    try back.setAssistCode(arena, "222", null);
+    try save(io, path, back);
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, text, "assist_codes") == null);
 }
 
 test "login lock is exclusive" {

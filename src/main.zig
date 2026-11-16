@@ -47,6 +47,9 @@ const usage_text =
     \\  login                                   Sign in by scanning a QR code with the UU Remote app
     \\  logout                                  Forget the account (keeps the device identity)
     \\  device list [--json]                    List the account's devices
+    \\  fav list [--recent] [--json]            List remote-assistance favorites (or recent hosts)
+    \\  fav add ID [NAME] [--save-code]         Add a share id to the favorites, or rename one
+    \\  fav rm NAME|ID                          Remove a favorite and its saved code
     \\  portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]
     \\  proxy DEVICE HOST PORT                  Connect stdin/stdout to HOST:PORT (ssh ProxyCommand)
     \\  terminal DEVICE [SESSION] [-e CHAR|none] | --list [--json] | --kill SESSION
@@ -55,7 +58,9 @@ const usage_text =
     \\                                          Run one command in a new remote shell, print its output
     \\                                          and exit with its exit status
     \\
-    \\DEVICE is a device id or name from `device list`.
+    \\DEVICE is a device id or name from `device list` or `fav list`. With --assist (portmap, proxy,
+    \\terminal, exec, files), DEVICE is the share id of a host offering remote assistance. Its code
+    \\comes from UUCLI_ASSIST_CODE, the config (fav add --save-code), or is asked for.
     \\
     \\Short forms:
     \\  dev = device, ls = list, pm = portmap, px = proxy, term = terminal, fs = files, x = exec
@@ -66,7 +71,8 @@ const usage_text =
     \\  --version    Print the version
     \\  -h, --help   Print this help
     \\
-    \\Environment: UUCLI_CONFIG (config file), UUCLI_USE_PROXY=1 (honor HTTP(S)_PROXY)
+    \\Environment: UUCLI_CONFIG (config file), UUCLI_USE_PROXY=1 (honor HTTP(S)_PROXY),
+    \\  UUCLI_ASSIST_CODE (remote-assistance code)
     \\
 ;
 
@@ -157,6 +163,8 @@ fn run(app: *App, all_args: []const [:0]const u8) Exit {
         cmdLogout(app, rest)
     else if (eql(cmd, "device"))
         cmdDevice(app, rest)
+    else if (eql(cmd, "fav"))
+        cmdFav(app, rest)
     else if (eql(cmd, "portmap"))
         cmdPortmap(app, rest)
     else if (eql(cmd, "proxy"))
@@ -372,10 +380,134 @@ pub fn displayWidth(s: []const u8) usize {
     return n;
 }
 
+// --- fav ---------------------------------------------------------------------------------------
+
+/// Remote-assistance favorites, stored on the account like the official apps' (spec §5.5).
+fn cmdFav(app: *App, args: []const [:0]const u8) !Exit {
+    const usage_fav = "expected `fav list [--recent] [--json] | add ID [NAME] [--save-code] | rm NAME|ID`";
+    if (args.len == 0) return usage(app, usage_fav, .{});
+    const sub = args[0];
+    var pos: std.ArrayList([]const u8) = .empty;
+    var json = false;
+    var recent = false;
+    var save_code = false;
+    for (args[1..]) |a| {
+        if (isFlag(a, "--json", "-j")) json = true else if (eql(a, "--recent")) recent = true else if (eql(a, "--save-code")) save_code = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
+    }
+    const p = pos.items;
+    const is_list = eql(sub, "list") or eql(sub, "ls");
+    const is_add = eql(sub, "add");
+    const is_rm = eql(sub, "rm") or eql(sub, "remove");
+    if (!(is_list and p.len == 0 and !save_code) and
+        !(is_add and p.len >= 1 and p.len <= 2 and !json and !recent) and
+        !(is_rm and p.len == 1 and !json and !recent and !save_code)) return usage(app, usage_fav, .{});
+
+    var cfg: config.Config = undefined;
+    var client: api.Client = undefined;
+    try signedInClient(app, &client, &cfg);
+    defer client.deinit();
+
+    if (is_list) {
+        const saved = try fetchSaved(app, &client, if (recent) .recent else .favorites);
+        if (json) try writeSavedJson(app.out, saved, &cfg) else try writeSavedTable(app.out, saved, &cfg);
+        return .ok;
+    }
+    if (is_add) {
+        const id = p[0];
+        const name = if (p.len == 2) p[1] else "";
+        // Asked before the request, so a failed read changes nothing on the account.
+        const code: ?[]const u8 = if (save_code) blk: {
+            if (app.env.get("UUCLI_ASSIST_CODE")) |c| if (c.len != 0) break :blk c;
+            break :blk try readCode(app, id, true);
+        } else null;
+        api.addFavorite(&client, app.arena, id, name, Io.Clock.real.now(app.io).toSeconds()) catch |err| return favCallError(app, "adding the favorite", &client, err);
+        if (code) |c| try updateSavedCode(app, id, c);
+        try app.err.print("Added favorite {s}{s}{s}{s}\n", .{ id, if (name.len != 0) " (" else "", name, if (name.len != 0) ")" else "" });
+        if (code != null) try app.err.writeAll("The code is saved in the config file\n");
+        return .ok;
+    }
+    const saved = try fetchSaved(app, &client, .favorites);
+    const f = switch (try api.resolveSaved(app.arena, saved, p[0])) {
+        .found => |f| f,
+        .not_found => return app.fail(.no_device, "no favorite {s}: see `uucli fav list`", .{p[0]}),
+        .ambiguous => |list| {
+            app.err.print("favorite name {s} is ambiguous; use an id:\n", .{p[0]}) catch {};
+            for (list) |x| app.err.print("  {s}  {s}\n", .{ x.id, x.name }) catch {};
+            return .usage;
+        },
+    };
+    api.removeSaved(&client, .favorites, f.publisher_device_id) catch |err| return favCallError(app, "removing the favorite", &client, err);
+    if (cfg.assistCode(f.id) != null) try updateSavedCode(app, f.id, null);
+    try app.err.print("Removed favorite {s} ({s})\n", .{ f.name, f.id });
+    return .ok;
+}
+
+fn favCallError(app: *App, what: []const u8, client: *const api.Client, err: anyerror) anyerror!Exit {
+    switch (err) {
+        error.ApiError => {
+            const f = &client.failure;
+            return app.fail(.other, "{s} failed: {f}{s}{s}", .{ what, f.*, if (f.msg_len != 0) ": " else "", f.msg() });
+        },
+        error.Network, error.Timeout, error.BadResponse => {
+            login.reportCallError(app.err, what, client, err);
+            return .other;
+        },
+        else => return err,
+    }
+}
+
+/// Stores (or with null forgets) the code of share `id`, under the config lock.
+fn updateSavedCode(app: *App, id: []const u8, code: ?[]const u8) !void {
+    const path = try app.configPath();
+    const l = try config.lock(app.io, path, .identity);
+    defer l.release(app.io);
+    var cfg = try app.loadConfig(path);
+    try cfg.setAssistCode(app.arena, id, code);
+    try config.save(app.io, path, cfg);
+}
+
+fn writeSavedJson(w: *Io.Writer, saved: []const api.Saved, cfg: *const config.Config) !void {
+    var s: std.json.Stringify = .{ .writer = w };
+    try s.beginArray();
+    for (saved) |x| {
+        try s.beginObject();
+        try s.objectField("id");
+        try s.write(x.id);
+        try s.objectField("name");
+        try s.write(x.name);
+        try s.objectField("favorite");
+        try s.write(x.favorite);
+        try s.objectField("code_saved");
+        try s.write(cfg.assistCode(x.id) != null);
+        try s.endObject();
+    }
+    try s.endArray();
+    try w.writeByte('\n');
+}
+
+fn writeSavedTable(w: *Io.Writer, saved: []const api.Saved, cfg: *const config.Config) !void {
+    var id_w: usize = "ID".len;
+    var name_w: usize = "NAME".len;
+    for (saved) |x| {
+        id_w = @max(id_w, displayWidth(x.id));
+        name_w = @max(name_w, displayWidth(x.name));
+    }
+    try pad(w, "ID", id_w + 2);
+    try pad(w, "NAME", name_w + 2);
+    try w.writeAll("FAVORITE  CODE\n");
+    for (saved) |x| {
+        try pad(w, x.id, id_w + 2);
+        try pad(w, x.name, name_w + 2);
+        try pad(w, if (x.favorite) "yes" else "no", "FAVORITE".len + 2);
+        try w.print("{s}\n", .{if (cfg.assistCode(x.id) != null) "saved" else "-"});
+    }
+}
+
 // --- portmap / proxy ---------------------------------------------------------------------------
 
 fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
     var device: ?[]const u8 = null;
+    var assist = false;
     var reconnect = true;
     var rules: std.ArrayList(portmap.Rule) = .empty;
     var i: usize = 0;
@@ -383,6 +515,8 @@ fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
         const a = args[i];
         if (isFlag(a, "--no-reconnect", "-n")) {
             reconnect = false;
+        } else if (eql(a, "--assist")) {
+            assist = true;
         } else if (eql(a, "-L") or std.mem.startsWith(u8, a, "-L")) {
             const spec = if (a.len > 2) a[2..] else blk: {
                 i += 1;
@@ -404,7 +538,7 @@ fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
     var client: api.Client = undefined;
     try signedInClient(app, &client, &cfg);
     defer client.deinit();
-    const target = try resolveTarget(app, &client, &cfg, query);
+    const target = try resolveTarget(app, &client, &cfg, .{ .query = query, .assist = assist }, true);
 
     var pm = try portmap.PortMap.init(app.io, app.gpa, rules.items);
     defer pm.deinit();
@@ -429,15 +563,18 @@ fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
         .bus = &bus,
         .client = &client,
         .cfg = &cfg,
-        .target = target,
+        .target = target.id,
+        .assist_code = target.assist_code,
         .pm = &pm,
         .reconnect = reconnect,
         .proxy = false,
     });
 }
 
-fn cmdProxy(app: *App, args: []const [:0]const u8) !Exit {
-    if (args.len != 3) return usage(app, "expected `proxy DEVICE HOST PORT`", .{});
+fn cmdProxy(app: *App, all_args: []const [:0]const u8) !Exit {
+    const assist = all_args.len != 0 and eql(all_args[0], "--assist");
+    const args = if (assist) all_args[1..] else all_args;
+    if (args.len != 3) return usage(app, "expected `proxy DEVICE HOST PORT` or `proxy --assist ID HOST PORT`", .{});
     const port = std.fmt.parseInt(u16, args[2], 10) catch 0;
     if (port == 0 or args[1].len == 0) return usage(app, "invalid HOST PORT", .{});
 
@@ -445,7 +582,8 @@ fn cmdProxy(app: *App, args: []const [:0]const u8) !Exit {
     var client: api.Client = undefined;
     try signedInClient(app, &client, &cfg);
     defer client.deinit();
-    const target = try resolveTarget(app, &client, &cfg, args[0]);
+    // stdin carries the stream, so a code cannot be read from it.
+    const target = try resolveTarget(app, &client, &cfg, .{ .query = args[0], .assist = assist }, false);
 
     var pm = try portmap.PortMap.init(app.io, app.gpa, &.{.{ .lport = 0, .host = args[1], .port = port }});
     defer pm.deinit();
@@ -460,38 +598,117 @@ fn cmdProxy(app: *App, args: []const [:0]const u8) !Exit {
         .bus = &bus,
         .client = &client,
         .cfg = &cfg,
-        .target = target,
+        .target = target.id,
+        .assist_code = target.assist_code,
         .pm = &pm,
         .reconnect = false,
         .proxy = true,
     });
 }
 
-/// DEVICE (id or name) → device id; exit 2 when ambiguous, 4 when unknown or offline.
-fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, query: []const u8) ![]const u8 {
-    return (try resolveDevice(app, client, cfg, query)).id;
-}
+/// DEVICE as given: a device id or name (account devices, then favorites), or with `--assist` a
+/// remote-assistance share id.
+const DeviceArg = struct { query: []const u8, assist: bool = false };
 
-fn resolveDevice(app: *App, client: *api.Client, cfg: *const config.Config, query: []const u8) !api.Device {
+/// Where a session goes: an account device, or a remote-assistance host (share id and code).
+const Target = struct {
+    id: []const u8,
+    assist_code: ?[]const u8 = null,
+    /// Set for account devices.
+    device: ?api.Device = null,
+};
+
+/// DEVICE → target (spec §3.3); exit 2 when ambiguous, 4 when unknown or offline. `stdin_free`:
+/// the tool does not read stdin, so a code may be read from it when it is not a terminal.
+fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, dev: DeviceArg, stdin_free: bool) !Target {
+    if (dev.assist) return .{ .id = dev.query, .assist_code = try assistCode(app, cfg, dev.query, stdin_free) };
     const devices = try fetchDevices(app, client, cfg);
-    switch (try api.resolveDevice(app.arena, devices, query)) {
+    switch (try api.resolveDevice(app.arena, devices, dev.query)) {
         .found => |d| {
             if (!d.online) {
                 _ = app.fail(.no_device, "device {s} ({s}) is offline", .{ d.name, d.id });
                 return error.ReportedNoDevice;
             }
-            return d;
+            return .{ .id = d.id, .device = d };
         },
-        .not_found => {
-            _ = app.fail(.no_device, "no device {s}: see `uucli device list`", .{query});
-            return error.ReportedNoDevice;
-        },
+        .not_found => {},
         .ambiguous => |list| {
-            app.err.print("device name {s} is ambiguous; use an id:\n", .{query}) catch {};
+            app.err.print("device name {s} is ambiguous; use an id:\n", .{dev.query}) catch {};
             for (list) |d| app.err.print("  {s}  {s}\n", .{ d.id, d.name }) catch {};
             return error.ReportedUsage;
         },
     }
+    const saved = try fetchSaved(app, client, .favorites);
+    switch (try api.resolveSaved(app.arena, saved, dev.query)) {
+        .found => |f| return .{ .id = f.id, .assist_code = try assistCode(app, cfg, f.id, stdin_free) },
+        .not_found => {
+            _ = app.fail(.no_device, "no device {s}: see `uucli device list` and `uucli fav list`", .{dev.query});
+            return error.ReportedNoDevice;
+        },
+        .ambiguous => |list| {
+            app.err.print("favorite name {s} is ambiguous; use an id:\n", .{dev.query}) catch {};
+            for (list) |f| app.err.print("  {s}  {s}\n", .{ f.id, f.name }) catch {};
+            return error.ReportedUsage;
+        },
+    }
+}
+
+/// The code for share `id`: UUCLI_ASSIST_CODE, else the saved one, else asked for.
+fn assistCode(app: *App, cfg: *const config.Config, id: []const u8, stdin_free: bool) ![]const u8 {
+    if (app.env.get("UUCLI_ASSIST_CODE")) |c| if (c.len != 0) return c;
+    if (cfg.assistCode(id)) |c| return c;
+    return readCode(app, id, stdin_free);
+}
+
+/// Reads a code: prompted without echo on a terminal, else one line of stdin when the tool leaves
+/// stdin alone. Never taken from the command line, where other users could see it.
+fn readCode(app: *App, id: []const u8, stdin_free: bool) ![]const u8 {
+    const is_tty = Io.File.stdin().isTty(app.io) catch false;
+    if (!is_tty and !stdin_free) {
+        _ = app.fail(.usage, "no code for {s}: set UUCLI_ASSIST_CODE or save one with `uucli fav add {s} --save-code`", .{ id, id });
+        return error.ReportedUsage;
+    }
+    var echo: ?tty.Raw = null;
+    if (is_tty) {
+        try app.err.print("Code for {s}: ", .{id});
+        try app.err.flush();
+        echo = tty.Raw.noEcho(0) catch null;
+    }
+    // One byte at a time: nothing after the line is consumed.
+    var buf: [1]u8 = undefined;
+    var r = Io.File.stdin().readerStreaming(app.io, &buf);
+    var line: std.ArrayList(u8) = .empty;
+    while (r.interface.takeByte()) |b| {
+        if (b == '\n') break;
+        if (line.items.len == 1024) break;
+        try line.append(app.arena, b);
+    } else |_| {}
+    if (echo) |e| {
+        e.restore();
+        app.err.writeByte('\n') catch {};
+    }
+    const code = std.mem.trimEnd(u8, line.items, "\r");
+    for (code) |b| if (b < 0x20 or b == 0x7f) {
+        _ = app.fail(.usage, "invalid code", .{});
+        return error.ReportedUsage;
+    };
+    if (std.mem.trim(u8, code, " ").len == 0) {
+        _ = app.fail(.usage, "no code given", .{});
+        return error.ReportedUsage;
+    }
+    return code;
+}
+
+/// Saved remote-assistance hosts of the account (spec §5.5).
+fn fetchSaved(app: *App, client: *api.Client, kind: api.SavedKind) ![]api.Saved {
+    return api.listSaved(client, app.arena, kind) catch |err| switch (err) {
+        error.NotSignedIn, error.OutOfMemory, error.Canceled => |e| return e,
+        error.ApiError, error.Network, error.Timeout, error.BadResponse => {
+            login.reportCallError(app.err, "favorites", client, err);
+            return error.Reported;
+        },
+        else => |e| return e,
+    };
 }
 
 const LoopSetup = struct {
@@ -499,6 +716,7 @@ const LoopSetup = struct {
     client: *api.Client,
     cfg: *const config.Config,
     target: []const u8,
+    assist_code: ?[]const u8,
     pm: *portmap.PortMap,
     reconnect: bool,
     proxy: bool,
@@ -516,7 +734,8 @@ fn sessionLoop(app: *App, l: LoopSetup) !Exit {
     var backoff = min_backoff;
     var first = true;
     while (true) {
-        if (!first) {
+        // An assistance host is not on the account; its join fails by itself once the share ends.
+        if (!first and l.assist_code == null) {
             // The device may have been removed meanwhile (exit 4), or the login expired (exit 3).
             if (stillListed(app, l)) |listed| {
                 if (!listed) return app.fail(.no_device, "device {s} is no longer on the account", .{l.target});
@@ -534,6 +753,7 @@ fn sessionLoop(app: *App, l: LoopSetup) !Exit {
             .own_device_id = l.cfg.device_id,
             .target = l.target,
             .capture_type = 9,
+            .assist_code = l.assist_code,
         }) catch |err| {
             const code: Exit = switch (err) {
                 error.Interrupted => return interruptedExit(),
@@ -631,7 +851,7 @@ fn openFailure(app: *App, err: session.OpenError) Exit {
 /// One session for a tool that runs `worker` (on its own task) while this task routes messages.
 fn runToolSession(
     app: *App,
-    query: []const u8,
+    dev: DeviceArg,
     capture: u32,
     comptime Tool: type,
     tool_state: *Tool,
@@ -641,9 +861,8 @@ fn runToolSession(
     var client: api.Client = undefined;
     try signedInClient(app, &client, &cfg);
     defer client.deinit();
-    const device = try resolveDevice(app, &client, &cfg, query);
-    const target = device.id;
-    if (@hasDecl(Tool, "device")) tool_state.device(device);
+    const target = try resolveTarget(app, &client, &cfg, dev, @hasDecl(Tool, "stdin_free") and Tool.stdin_free);
+    if (target.device) |d| if (@hasDecl(Tool, "device")) tool_state.device(d);
 
     var bus_buf: [256]session.Event = undefined;
     var bus: session.Bus = undefined;
@@ -658,10 +877,14 @@ fn runToolSession(
         .client = &client,
         .http = &client.http,
         .own_device_id = cfg.device_id,
-        .target = target,
+        .target = target.id,
         .capture_type = capture,
+        .assist_code = target.assist_code,
     }) catch |err| return openFailure(app, err);
     defer s.close();
+    // An assistance host is not in the device list; its platform comes from the room join.
+    if (@hasDecl(Tool, "device") and target.device == null) if (s.publisher_platform) |p|
+        tool_state.device(.{ .id = target.id, .name = target.id, .platform = .from(p), .online = true, .shared = true });
     tool_state.bind(app.io, app.gpa, s);
     defer tool_state.unbind();
 
@@ -723,11 +946,14 @@ fn cmdTerminal(app: *App, args: []const [:0]const u8) !Exit {
     var list = false;
     var json = false;
     var kill: ?u32 = null;
+    var assist = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (isFlag(a, "--list", "-l")) {
             list = true;
+        } else if (eql(a, "--assist")) {
+            assist = true;
         } else if (isFlag(a, "--json", "-j")) {
             json = true;
         } else if (isFlag(a, "--kill", "-k") or eql(a, "-e")) {
@@ -754,7 +980,7 @@ fn cmdTerminal(app: *App, args: []const [:0]const u8) !Exit {
         .mode = if (list) .{ .list = json } else if (kill) |k| .{ .kill = k } else .{ .attach = session_id orelse 0 },
         .escape = escape,
     };
-    return runToolSession(app, query, 8, TerminalCmd, &cmd, terminalWorker);
+    return runToolSession(app, .{ .query = query, .assist = assist }, 8, TerminalCmd, &cmd, terminalWorker);
 }
 
 fn terminalError(app: *App, err: terminal.Error) Exit {
@@ -774,6 +1000,8 @@ fn terminalError(app: *App, err: terminal.Error) Exit {
 // --- exec ------------------------------------------------------------------------------------
 
 const ExecCmd = struct {
+    /// stdin is not used, so an assistance code may be read from it.
+    pub const stdin_free = true;
     t: terminal.Terminal = undefined,
     command: []const u8,
     timeout: ?Io.Duration,
@@ -811,6 +1039,7 @@ fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
     var device: ?[]const u8 = null;
     var timeout_s: u32 = 300;
     var json = false;
+    var assist = false;
     var i: usize = 0;
     // Options come before COMMAND; the first other word after DEVICE (or `--`) starts it, so the
     // command can have options of its own.
@@ -821,6 +1050,8 @@ fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
             break;
         } else if (isFlag(a, "--json", "-j")) {
             json = true;
+        } else if (eql(a, "--assist")) {
+            assist = true;
         } else if (isFlag(a, "--timeout", "-t")) {
             i += 1;
             if (i == args.len) return usage(app, "{s} needs a number of seconds", .{a});
@@ -844,7 +1075,7 @@ fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
         .timeout = if (timeout_s == 0) null else .fromSeconds(timeout_s),
         .json = json,
     };
-    return runToolSession(app, query, 8, ExecCmd, &cmd, execWorker);
+    return runToolSession(app, .{ .query = query, .assist = assist }, 8, ExecCmd, &cmd, execWorker);
 }
 
 fn execWorker(app: *App, cmd: *ExecCmd) Exit {
@@ -975,6 +1206,7 @@ fn stdinReader(io: Io, t: *terminal.Terminal) Io.Cancelable!void {
 // --- files -------------------------------------------------------------------------------------
 
 const FilesCmd = struct {
+    pub const stdin_free = true;
     f: files.Files = undefined,
     op: union(enum) {
         ls: struct { path: []const u8, json: bool },
@@ -1004,8 +1236,9 @@ fn cmdFiles(app: *App, args: []const [:0]const u8) !Exit {
     var pos: std.ArrayList([]const u8) = .empty;
     var json = false;
     var force = false;
+    var assist = false;
     for (args) |a| {
-        if (isFlag(a, "--json", "-j")) json = true else if (isFlag(a, "--force", "-f")) force = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
+        if (isFlag(a, "--json", "-j")) json = true else if (isFlag(a, "--force", "-f")) force = true else if (eql(a, "--assist")) assist = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
     }
     const p = pos.items;
     if (p.len < 2) return usage(app, usage_files, .{});
@@ -1024,7 +1257,7 @@ fn cmdFiles(app: *App, args: []const [:0]const u8) !Exit {
         if (files.splitRemote(p[3]) == null) return usage(app, "invalid remote file name {s}", .{p[3]});
         cmd = .{ .op = .{ .put = .{ .local = p[2], .remote = p[3], .force = force } } };
     } else return usage(app, usage_files, .{});
-    return runToolSession(app, p[0], 5, FilesCmd, &cmd, filesWorker);
+    return runToolSession(app, .{ .query = p[0], .assist = assist }, 5, FilesCmd, &cmd, filesWorker);
 }
 
 fn filesError(app: *App, f: *const files.Files, err: files.Error) Exit {

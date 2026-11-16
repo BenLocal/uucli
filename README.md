@@ -1,8 +1,9 @@
 # uucli
 
 A headless command-line client for NetEase UU Remote (网易UU远程), for Linux and macOS. It signs in
-to your own UU account with a QR code and reaches the hosts bound to that account: TCP port
-forwarding (for example as an SSH tunnel), a remote terminal, and file transfer.
+to your own UU account with a QR code and reaches the hosts bound to that account, or a host that
+offers remote assistance by share id and code: TCP port forwarding (for example as an SSH tunnel),
+a remote terminal, and file transfer.
 
 The protocol is ported from [uu-remote-linux](https://github.com/VallierDev/uu-remote-linux)
 v0.2.59. uucli is not affiliated with NetEase. The specification is in [docs/spec.md](docs/spec.md).
@@ -99,6 +100,31 @@ uucli files office-pc put backup.tar /home/me/backup.tar
 
 One regular file per transfer. Remote paths are passed through as written. `get` writes
 `LOCAL.uucli-part` and renames it when complete. Ctrl-C cancels and tells the host.
+
+## Remote assistance
+
+A host of another account that turned on remote assistance gives out a share id and a code (the
+「开始协助」 invitation). Pass the share id with `--assist`; uucli asks for the code without echoing it:
+
+```sh
+uucli exec --assist 123456789 -- hostname
+uucli term --assist 123456789
+```
+
+Favorites are stored on your account, like in the official apps, and are reachable by name:
+
+```sh
+uucli fav add 123456789 lab-pc                # --save-code also stores the code in the config
+uucli fav add 123456789 lab-2                 # adding again renames
+uucli fav list                                # ID NAME FAVORITE CODE; --recent for recent hosts
+uucli exec lab-pc -- hostname
+uucli fav rm lab-pc
+```
+
+The code is read from `UUCLI_ASSIST_CODE`, then the config, then asked for on the terminal (or read
+as one line from stdin when it is not a terminal and the command does not use stdin). It is never
+taken from the command line. A temporary code can stop working after it was used; ask the host for a
+new one, or for a fixed code to save.
 
 ## Short forms
 

@@ -143,9 +143,11 @@ pub const Setup = struct {
     http: *std.http.Client,
     /// uucli's own device id (ConnectOptions field 9).
     own_device_id: []const u8,
-    /// The controlled host.
+    /// The controlled host (its share id when `assist_code` is set).
     target: []const u8,
     capture_type: u32,
+    /// Remote-assistance code: join the partner's share room instead of an account device.
+    assist_code: ?[]const u8 = null,
 };
 
 var next_gen: std.atomic.Value(u32) = .init(1);
@@ -163,6 +165,8 @@ pub const Session = struct {
     gen: u32,
     capture_type: u32,
     own_device_id: []const u8,
+    /// From the room join (1 Windows, 4 Mac); null when the server did not say.
+    publisher_platform: ?i64,
 
     sig: signal.Signal,
     reader: ?Io.Future(void) = null,
@@ -201,7 +205,11 @@ pub const Session = struct {
         // The session takes the arena by value below; from then on `s.close` frees it.
         var arena_moved = false;
         errdefer if (!arena_moved) arena.deinit();
-        const room = api.joinRoom(setup.client, arena.allocator(), setup.target) catch |err| return switch (err) {
+        const joined = if (setup.assist_code) |code|
+            api.joinShare(setup.client, arena.allocator(), setup.target, code)
+        else
+            api.joinRoom(setup.client, arena.allocator(), setup.target);
+        const room = joined catch |err| return switch (err) {
             error.NotSignedIn => error.NotSignedIn,
             error.DeviceBusy => error.DeviceBusy,
             error.Canceled => error.Canceled,
@@ -235,6 +243,7 @@ pub const Session = struct {
             .gen = next_gen.fetchAdd(1, .monotonic),
             .capture_type = setup.capture_type,
             .own_device_id = setup.own_device_id,
+            .publisher_platform = room.publisher_platform,
             .sig = sig,
             .setup_deadline = started.addDuration(setup_timeout),
             .app_control_id = uuid(io),

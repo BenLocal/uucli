@@ -174,7 +174,7 @@ pub const Client = struct {
         c.http.deinit();
     }
 
-    pub const Method = enum { GET, POST };
+    pub const Method = enum { GET, POST, DELETE };
 
     pub const Response = struct {
         parsed: std.json.Parsed(std.json.Value),
@@ -204,6 +204,7 @@ pub const Client = struct {
             .method = switch (method) {
                 .GET => .GET,
                 .POST => .POST,
+                .DELETE => .DELETE,
             },
             .payload = if (method == .POST) body else null,
             .keep_alive = false,
@@ -439,22 +440,150 @@ pub fn joinRoom(c: *Client, arena: Allocator, device: []const u8) (JoinError || 
             else => |e| return e,
         };
         defer resp.deinit();
-        const d = resp.data;
-        if (d != .object) return error.JoinFailed;
-        // Required by upstream's schema although unused.
-        if (str(d, "report_token") == null or str(d, "report_url") == null) return error.BadResponse;
-        const token = str(d, "token") orelse "";
-        var list: std.ArrayList([]const u8) = .empty;
-        if (d.object.get("signaling_list")) |l| if (l == .array) for (l.array.items) |u| if (u == .string)
-            try list.append(arena, try arena.dupe(u8, u.string));
-        if (token.len == 0 or list.items.len == 0) return error.JoinFailed;
-        return .{
-            .token = try arena.dupe(u8, token),
-            .signaling_list = list.items,
-            .ws_connect_timeout_ms = int(d, "ws_connect_timeout_ms") orelse 0,
-            .publisher_platform = int(d, "publisher_platform"),
-        };
+        return parseRoom(arena, resp.data);
     }
+}
+
+/// Joins a remote-assistance room by the partner's share id and code (upstream `join_share`):
+/// `POST /api/v2/room/join/share/by_code`, falling back to v1 when v2 is missing (HTTP 404/405).
+/// Not retried: a wrong or expired code does not get better.
+pub fn joinShare(c: *Client, arena: Allocator, connect_id: []const u8, connect_code: []const u8) JoinError!Room {
+    const body = try std.json.Stringify.valueAlloc(arena, .{ .connect_id = connect_id, .connect_code = connect_code }, .{});
+    for ([_][]const u8{ "/api/v2/room/join/share/by_code", "/api/v1/room/join/share/by_code" }, 0..) |path, i| {
+        var resp = c.call(.POST, path, body, .fromSeconds(15)) catch |err| switch (err) {
+            error.ApiError, error.BadResponse => {
+                if (i == 0 and (c.failure.status == 404 or c.failure.status == 405)) continue;
+                if (err == error.BadResponse) return err;
+                const code: i64 = if (c.failure.code) |k| (if (k == 0) c.failure.status else k) else -1;
+                if (code == 2002) return error.DeviceBusy;
+                // The server message may quote the request; never show it if it contains the code.
+                if (std.mem.indexOf(u8, c.failure.msg(), connect_code) != null) c.failure.msg_len = 0;
+                return error.JoinFailed;
+            },
+            else => |e| return e,
+        };
+        defer resp.deinit();
+        return parseRoom(arena, resp.data);
+    }
+    unreachable;
+}
+
+/// Room join response `data` (spec §6.1); strings are copied into `arena`.
+fn parseRoom(arena: Allocator, d: std.json.Value) JoinError!Room {
+    if (d != .object) return error.JoinFailed;
+    // Required by upstream's schema although unused.
+    if (str(d, "report_token") == null or str(d, "report_url") == null) return error.BadResponse;
+    const token = str(d, "token") orelse "";
+    var list: std.ArrayList([]const u8) = .empty;
+    if (d.object.get("signaling_list")) |l| if (l == .array) for (l.array.items) |u| if (u == .string)
+        try list.append(arena, try arena.dupe(u8, u.string));
+    if (token.len == 0 or list.items.len == 0) return error.JoinFailed;
+    return .{
+        .token = try arena.dupe(u8, token),
+        .signaling_list = list.items,
+        .ws_connect_timeout_ms = int(d, "ws_connect_timeout_ms") orelse 0,
+        .publisher_platform = int(d, "publisher_platform"),
+    };
+}
+
+/// The account's saved remote-assistance hosts (spec §5.5): favorites, or recently connected.
+pub const SavedKind = enum { favorites, recent };
+
+pub const Saved = struct {
+    /// The share id the partner gives out (`connect_id`).
+    id: []const u8,
+    /// `remark`, falling back to the id.
+    name: []const u8,
+    /// Key of the DELETE call.
+    publisher_device_id: []const u8,
+    favorite: bool,
+};
+
+/// One page of `GET /api/v1/device/share/saved/{kind}`: `{saved: [...], next}`. Strings point into
+/// `data`; `next` is the cursor of the following page.
+pub fn parseSaved(arena: Allocator, data: std.json.Value) Allocator.Error!struct { items: []Saved, next: ?[]const u8 } {
+    var out: std.ArrayList(Saved) = .empty;
+    if (data == .object) if (data.object.get("saved")) |list| if (list == .array) for (list.array.items) |e| {
+        const id = str(e, "connect_id") orelse continue;
+        if (id.len == 0) continue;
+        const remark = str(e, "remark") orelse "";
+        try out.append(arena, .{
+            .id = id,
+            .name = if (remark.len != 0) remark else id,
+            .publisher_device_id = str(e, "publisher_device_id") orelse "",
+            .favorite = if (e.object.get("is_favorite")) |f| f == .bool and f.bool else false,
+        });
+    };
+    const next: ?[]const u8 = if (data == .object) if (data.object.get("next")) |n| switch (n) {
+        .string => |x| if (x.len != 0) x else null,
+        .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        else => null,
+    } else null else null;
+    return .{ .items = out.items, .next = next };
+}
+
+/// All pages of a saved list; strings are copied into `arena`.
+pub fn listSaved(c: *Client, arena: Allocator, kind: SavedKind) (CallError || error{InvalidDevice})![]Saved {
+    var all: std.ArrayList(Saved) = .empty;
+    var cursor: ?[]const u8 = null;
+    // Bounded: a server that keeps returning a cursor must not loop forever.
+    for (0..100) |_| {
+        var seg_buf: [512]u8 = undefined;
+        var path_buf: [700]u8 = undefined;
+        const path = if (cursor) |cur|
+            std.fmt.bufPrint(&path_buf, "/api/v1/device/share/saved/{t}?cursor={s}", .{ kind, try pathSegment(&seg_buf, cur) }) catch return error.BadResponse
+        else
+            std.fmt.bufPrint(&path_buf, "/api/v1/device/share/saved/{t}", .{kind}) catch unreachable;
+        var resp = try c.call(.GET, path, "", .fromSeconds(15));
+        defer resp.deinit();
+        const page = try parseSaved(arena, resp.data);
+        for (page.items) |s| try all.append(arena, .{
+            .id = try arena.dupe(u8, s.id),
+            .name = try arena.dupe(u8, s.name),
+            .publisher_device_id = try arena.dupe(u8, s.publisher_device_id),
+            .favorite = s.favorite,
+        });
+        cursor = if (page.next) |n| try arena.dupe(u8, n) else return all.items;
+    }
+    return all.items;
+}
+
+/// `POST /api/v1/device/share/saved/favorites` with one entry (the official Android app's
+/// `AssistFavoriteInput`). `now` is in seconds.
+pub fn addFavorite(c: *Client, arena: Allocator, id: []const u8, name: []const u8, now: i64) CallError!void {
+    const body = try std.json.Stringify.valueAlloc(arena, .{
+        .favorites = .{.{ .connect_id = id, .remark = name, .favorited_at = now }},
+        .skip_invalid = false,
+    }, .{});
+    var resp = try c.call(.POST, "/api/v1/device/share/saved/favorites", body, .fromSeconds(15));
+    resp.deinit();
+}
+
+/// `DELETE /api/v1/device/share/saved/{kind}/{publisher_device_id}`.
+pub fn removeSaved(c: *Client, kind: SavedKind, publisher_device_id: []const u8) (CallError || error{InvalidDevice})!void {
+    var seg_buf: [512]u8 = undefined;
+    var path_buf: [700]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/api/v1/device/share/saved/{t}/{s}", .{ kind, try pathSegment(&seg_buf, publisher_device_id) }) catch return error.InvalidDevice;
+    var resp = try c.call(.DELETE, path, "", .fromSeconds(15));
+    resp.deinit();
+}
+
+pub const SavedResolution = union(enum) {
+    found: Saved,
+    not_found,
+    ambiguous: []const Saved,
+};
+
+/// Same rules as `resolveDevice`: exact share id, else exact case-insensitive name.
+pub fn resolveSaved(arena: Allocator, saved: []const Saved, query: []const u8) Allocator.Error!SavedResolution {
+    for (saved) |s| if (std.mem.eql(u8, s.id, query)) return .{ .found = s };
+    var matches: std.ArrayList(Saved) = .empty;
+    for (saved) |s| if (std.ascii.eqlIgnoreCase(s.name, query)) try matches.append(arena, s);
+    return switch (matches.items.len) {
+        0 => .not_found,
+        1 => .{ .found = matches.items[0] },
+        else => .{ .ambiguous = matches.items },
+    };
 }
 
 const testing = std.testing;
@@ -514,6 +643,34 @@ test "buildHeaders with token" {
         .{ .name = "x-param-user-id", .value = "u" },      .{ .name = "x-param-ts", .value = "1" },
     };
     try testing.expectEqualStrings(&sign("custom", "GET", "/api/v1/device/list", &params, ""), h.get("X-Param-SIGN").?);
+}
+
+test "parseSaved and resolveSaved" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // As the server returns it (structure observed live, values made up).
+    const data = try std.json.parseFromSliceLeaky(std.json.Value, ar,
+        \\{"saved":[
+        \\  {"publisher_device_id":"p1","connect_id":"111","remark":"Lab","is_favorite":true,"platform":null,"last_connected_at":1,"favorited_at":2},
+        \\  {"publisher_device_id":"p2","connect_id":"222","remark":"","is_favorite":false},
+        \\  {"publisher_device_id":"p3","connect_id":"","remark":"no id"},
+        \\  {"publisher_device_id":"p4","connect_id":"333","remark":"lab"}],
+        \\ "next":"c2"}
+    , .{});
+    const page = try parseSaved(ar, data);
+    try testing.expectEqual(@as(usize, 3), page.items.len);
+    try testing.expectEqualStrings("Lab", page.items[0].name);
+    try testing.expectEqualStrings("p1", page.items[0].publisher_device_id);
+    try testing.expect(page.items[0].favorite and !page.items[1].favorite);
+    try testing.expectEqualStrings("222", page.items[1].name);
+    try testing.expectEqualStrings("c2", page.next.?);
+    const last = try std.json.parseFromSliceLeaky(std.json.Value, ar, "{\"saved\":[],\"next\":null}", .{});
+    try testing.expectEqual(@as(?[]const u8, null), (try parseSaved(ar, last)).next);
+
+    try testing.expectEqualStrings("p2", (try resolveSaved(ar, page.items, "222")).found.publisher_device_id);
+    try testing.expectEqual(@as(usize, 2), (try resolveSaved(ar, page.items, "LAB")).ambiguous.len);
+    try testing.expect(try resolveSaved(ar, page.items, "nope") == .not_found);
 }
 
 test "parseDevices and resolveDevice" {

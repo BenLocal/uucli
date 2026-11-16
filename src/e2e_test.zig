@@ -31,26 +31,36 @@ fn apiServer(server: *net.Server, io: Io, ws_port: u16) Io.Cancelable!void {
         var rbuf: [8192]u8 = undefined;
         var r = conn.reader(io, &rbuf);
         var content_length: usize = 0;
-        var join = false;
+        var route: enum { other, join, share_v2, share_v1 } = .other;
         var first = true;
         while (true) {
             const line = std.mem.trimEnd(u8, r.interface.takeDelimiterInclusive('\n') catch break, "\r\n");
             if (line.len == 0) break;
-            if (first) join = std.mem.indexOf(u8, line, "/api/v1/room/join/by_device/host-dev") != null;
+            if (first) {
+                if (std.mem.indexOf(u8, line, "/api/v1/room/join/by_device/host-dev") != null) route = .join;
+                // Like a server without the v2 path, so the client falls back to v1.
+                if (std.mem.indexOf(u8, line, "/api/v2/room/join/share/by_code") != null) route = .share_v2;
+                if (std.mem.indexOf(u8, line, "/api/v1/room/join/share/by_code") != null) route = .share_v1;
+            }
             first = false;
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
             if (std.ascii.eqlIgnoreCase(line[0..colon], "content-length"))
                 content_length = std.fmt.parseInt(usize, std.mem.trim(u8, line[colon + 1 ..], " "), 10) catch 0;
         }
-        r.interface.discardAll(content_length) catch continue;
+        const req = r.interface.take(@min(content_length, rbuf.len)) catch continue;
         var body_buf: [512]u8 = undefined;
-        const body = if (join)
-            std.fmt.bufPrint(&body_buf, "{{\"code\":0,\"msg\":\"\",\"data\":{{\"token\":\"room-token\",\"report_token\":\"x\",\"report_url\":\"x\",\"signaling_list\":[\"ws://127.0.0.1:{d}\"]}}}}", .{ws_port}) catch unreachable
-        else
-            "{\"code\":404,\"msg\":\"unknown\"}";
+        const room = std.fmt.bufPrint(&body_buf, "{{\"code\":0,\"msg\":\"\",\"data\":{{\"token\":\"room-token\",\"report_token\":\"x\",\"report_url\":\"x\",\"signaling_list\":[\"ws://127.0.0.1:{d}\"]}}}}", .{ws_port}) catch unreachable;
+        const good_code = std.mem.indexOf(u8, req, "\"connect_id\":\"share-1\",\"connect_code\":\"good-code\"") != null;
+        const status: u16, const body: []const u8 = switch (route) {
+            .join => .{ 200, room },
+            .share_v2 => .{ 404, "<html>not found</html>" },
+            // The wrong-code message quotes the code, as a careless server might.
+            .share_v1 => if (good_code) .{ 200, room } else .{ 400, "{\"code\":1131,\"msg\":\"wrong code bad-code\"}" },
+            .other => .{ 200, "{\"code\":404,\"msg\":\"unknown\"}" },
+        };
         var wbuf: [1024]u8 = undefined;
         var w = conn.writer(io, &wbuf);
-        w.interface.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        w.interface.print("HTTP/1.1 {d} X\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, body.len, body }) catch continue;
         w.interface.flush() catch {};
     }
 }
@@ -715,6 +725,21 @@ const Env = struct {
         });
     }
 
+    /// Joins by remote-assistance share id and code instead of an account device.
+    fn openAssist(e: *Env, capture: u32, code: []const u8) !*session.Session {
+        return session.Session.open(.{
+            .io = e.io,
+            .gpa = e.gpa,
+            .bus = &e.bus,
+            .client = &e.client,
+            .http = &e.client.http,
+            .own_device_id = e.cfg.device_id,
+            .target = "share-1",
+            .capture_type = capture,
+            .assist_code = code,
+        });
+    }
+
     fn deinit(e: *Env) void {
         e.client.deinit();
         e.host_task.cancel(e.io) catch {};
@@ -793,6 +818,40 @@ test "terminal end to end through a fake host" {
 
     env.bus.put(.interrupt);
     try testing.expectEqual(session.End.interrupted, try run_task.await(io));
+}
+
+test "remote-assistance join falls back to v1 and reaches a working session" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env: Env = undefined;
+    try env.init(io, gpa);
+    defer env.deinit();
+    const s = try env.openAssist(8, "good-code");
+    defer s.close();
+    var t: terminal.Terminal = undefined;
+    t.init(io, gpa, s);
+    defer t.deinit();
+    var run_task = try io.concurrent(session.Session.run, .{ s, t.tool() });
+    var ticker = try io.concurrent(terminal.Terminal.ticker, .{&t});
+    defer ticker.cancel(io) catch {};
+    try t.checkEnv();
+    env.bus.put(.interrupt);
+    try testing.expectEqual(session.End.interrupted, try run_task.await(io));
+}
+
+// Through `api.joinShare`: `Session.open` logs the failure at error level, which fails a test.
+test "a wrong remote-assistance code fails without echoing the code" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env: Env = undefined;
+    try env.init(io, gpa);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    try testing.expectError(error.JoinFailed, api.joinShare(&env.client, arena.allocator(), "share-1", "bad-code"));
+    try testing.expectEqual(@as(?i64, 1131), env.client.failure.code);
+    try testing.expectEqual(@as(u16, 400), env.client.failure.status);
+    try testing.expectEqualStrings("", env.client.failure.msg());
 }
 
 test "files end to end through a fake host" {

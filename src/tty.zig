@@ -33,6 +33,15 @@ pub const Raw = struct {
         return .{ .fd = fd, .saved = saved };
     }
 
+    /// Turns off echo only (for reading a secret line); `restore` undoes it.
+    pub fn noEcho(fd: posix.fd_t) !Raw {
+        const saved = try posix.tcgetattr(fd);
+        var t = saved;
+        t.lflag.ECHO = false;
+        try posix.tcsetattr(fd, .NOW, t);
+        return .{ .fd = fd, .saved = saved };
+    }
+
     pub fn restore(r: Raw) void {
         posix.tcsetattr(r.fd, .NOW, r.saved) catch {};
     }

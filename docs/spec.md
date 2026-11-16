@@ -3,14 +3,15 @@
 ## 1. Goal
 
 uucli is a headless UU Remote (网易UU远程) **controller** CLI written in Zig. It runs on Linux and macOS,
-signs in with a UU account, and gives the user, against a device bound to that account:
+signs in with a UU account, and gives the user, against a device bound to that account or a host
+that offers remote assistance (share id and code, §5.5):
 
 - a TCP port forward (`portmap`, `proxy`), so ssh / scp / rsync / VS Code Remote work over UU Remote;
 - a remote terminal attached to the current tty (`terminal`);
 - single-file transfer (`files`).
 
-Non-goals: remote desktop, audio/video, clipboard, gamepad, remote assistance (share codes), any GUI,
-acting as a controlled host, Windows as the uucli platform.
+Non-goals: remote desktop, audio/video, clipboard, gamepad, any GUI, acting as a controlled host
+(including offering remote assistance), Windows as the uucli platform.
 
 ## 2. Fixed decisions
 
@@ -62,9 +63,15 @@ sees a clean exit. SIGPIPE is ignored: a closed local socket or stdout is a writ
 1. Exact match on `device_id`.
 2. Otherwise exact, case-insensitive match on the display name (`alias`, falling back to `device_id`).
 3. More than one name match → exit 2 and list the candidates (id, name, platform) on stderr.
-4. No match → exit 4.
+4. No match → the same two steps against the account's remote-assistance favorites (§5.5): exact
+   `connect_id`, else exact case-insensitive `remark` (falling back to `connect_id`). A match joins
+   by share id and code (§6.1); more than one name match → exit 2.
+5. No match → exit 4.
 
-No fuzzy or prefix matching.
+No fuzzy or prefix matching. A matched account device that is offline → exit 4.
+
+`--assist` (accepted by `portmap`, `proxy`, `terminal`, `exec`, `files`) skips the lookup: `DEVICE`
+is a share id, joined by code.
 
 ### 3.4 Commands
 
@@ -73,6 +80,9 @@ No fuzzy or prefix matching.
 | `uucli login` | M1 | QR sign-in (§5.3). Prints the QR to stderr. On success prints `Signed in as NAME (USER_ID)` to stderr; stdout stays empty. |
 | `uucli logout` | M1 | Clears `user_id`, `token`, `csrf`, `account_name`. Keeps the device identity so the next login reuses the same device. Local only, no API call. |
 | `uucli device list [--json]` | M1 | Lists account devices (§5.4). |
+| `uucli fav list [--recent] [--json]` | — | Lists the account's remote-assistance favorites, or with `--recent` the recently connected hosts (§5.5). Columns `ID NAME FAVORITE CODE`; `CODE` is `saved` when a code is in the config. JSON: `[{"id", "name", "favorite", "code_saved"}]`. |
+| `uucli fav add ID [NAME] [--save-code]` | — | Adds share `ID` to the favorites with remark `NAME` (§5.5). `--save-code` also stores its code in the config (§5.6). Adding an existing favorite again replaces its remark (verified 2026-11-16), so this also renames. |
+| `uucli fav rm NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
 | `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
 | `uucli proxy DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. Exits when either side closes. |
 | `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). |
@@ -105,6 +115,8 @@ command never changes what an existing abbreviation means.
 | `-n` | `--no-reconnect` |
 | `-t` | `--timeout` |
 
+`fav` and `--assist` have no short form.
+
 `login` and `logout` have no short form: login is an interactive QR flow, and logout drops the
 account, so neither should be typed by accident.
 
@@ -123,7 +135,7 @@ Host office-pc
 | Path | `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `~/.config/uucli/config.json` (macOS too) |
 | Permissions | file `0600`, directory `0700`; uucli refuses to read a config readable by group/other and says how to fix it |
 | Writes | write `config.json.tmp` (0600) → fsync → rename |
-| Locking | Lock files are named after the config file's stem (`config.json` → `config.lock`, `config.login.lock`). Blocking `flock` on `STEM.lock` around device registration and login (and `logout`), so two processes cannot register two devices |
+| Locking | Lock files are named after the config file's stem (`config.json` → `config.lock`, `config.login.lock`). Blocking `flock` on `STEM.lock` around device registration and login (and `logout`, and saving codes in `fav add` / `fav rm`), so two processes cannot register two devices |
 
 ```json
 {
@@ -135,9 +147,12 @@ Host office-pc
   "token": "JWT access token",
   "csrf": "csrf claim from the token",
   "account_name": "nickname, display only",
-  "sign_key": "optional override; default is upstream DEFAULT_SIGN_KEY"
+  "sign_key": "optional override; default is upstream DEFAULT_SIGN_KEY",
+  "assist_codes": [{"id": "share id", "code": "remote-assistance code (§5.6)"}]
 }
 ```
+
+`assist_codes` is written only when non-empty.
 
 uucli does not read `~/.config/uuremote/config.json` and does not honor upstream `UU_*` variables.
 
@@ -269,6 +284,40 @@ The uucli device itself (`current_device` / own `device_id`) is excluded from th
 [{"id": "aeawswhnguarjyo6", "name": "office-pc", "platform": "windows", "online": true, "shared": false}]
 ```
 
+### 5.5 Remote-assistance favorites
+
+Source: the official Android app 4.47.0 (`AssistFavoriteInput`, saved-share requests); response
+structure observed live 2026-11-16. A host offering remote assistance gives out a share id
+(`connect_id`, e.g. 9 digits) and a code. The account keeps two server-side lists of such hosts,
+shared with the official apps:
+
+- `GET /api/v1/device/share/saved/{favorites|recent}`, optional query `cursor`, `limit` (the query is
+  part of the signed path). `data`: `{"saved": [...], "next": cursor or null}`. Entry fields:
+  `publisher_device_id`, `connect_id`, `remark`, `is_favorite`, `platform` (may be null),
+  `last_connected_at` (seconds), `favorited_at` (seconds or null). uucli follows `next` (at most 100
+  pages). A host joined by code appears in `recent` by itself.
+- `POST /api/v1/device/share/saved/favorites`, body
+  `{"favorites": [{"connect_id": ID, "remark": NAME, "favorited_at": NOW_SECONDS}], "skip_invalid": false}`.
+  For an existing favorite it replaces the remark (there is no separate edit call in the app).
+- `DELETE /api/v1/device/share/saved/{favorites|recent}/{publisher_device_id}`, empty body. Removing a
+  favorite also clears its remark in `recent`.
+
+The server never stores the code.
+
+### 5.6 Remote-assistance codes
+
+The code for a share id comes from, in order:
+
+1. `UUCLI_ASSIST_CODE`;
+2. the config's `assist_codes` (saved by `fav add --save-code`);
+3. a prompt `Code for ID: ` on stderr, read from stdin with echo off, when stdin is a terminal;
+4. one line of stdin when it is not a terminal and the command does not use stdin (`exec`, `files`,
+   `portmap`, `fav add`).
+
+Otherwise (`proxy`, `terminal` without a terminal) → exit 2 naming the two first sources. The code is
+never taken from the command line, where other local users could read it, and never logged. A
+temporary code may stop working after it was used; a wrong or expired code fails the join (§6.1).
+
 ## 6. Connection setup (M2)
 
 One **session** = one room join + one signaling socket + one PeerConnection, opened for one tool.
@@ -294,6 +343,15 @@ Empty `token` or `signaling_list` → exit 5.
 Retry: on API error codes other than `-1, 2002, 2006, 2007, 4042`, retry up to 5 times, 3 s apart.
 `2002` → exit 6 ("the host is already being controlled from another device").
 `1120` → exit 3.
+
+A remote-assistance host (§5.5) is joined by share id and code instead (upstream after the pin,
+`src/viewer/api.rs` `join_share`): `POST /api/v2/room/join/share/by_code`, body
+`{"connect_id": ID, "connect_code": CODE}`; when v2 answers HTTP 404 or 405, the same request to
+`/api/v1/room/join/share/by_code`. Same response as above. No retry. A wrong or expired code, or a
+host that turned assistance off → HTTP 400 code 1131 → exit 5; the server message is shown unless it
+contains the code. Same-account devices cannot assist each other (server message). The join answer's
+`publisher_platform` picks the `exec` shell (§11.1.1), since the host is not in the device list.
+Assistance sessions skip the device-list check before a `portmap` reconnect (§7.1).
 
 ### 6.2 Signaling (Socket.IO over WebSocket)
 
@@ -465,7 +523,9 @@ Default on for `portmap`, off for `proxy`.
 - Backoff: 1 s, 2 s, 4 s ... capped at 60 s, reset after a session stays ready for 60 s.
 - Local listeners stay bound during reconnect. Connections accepted while no session is ready are
   closed immediately.
-- Exit 3 (token expired) and exit 4 (device removed) end the process instead of retrying.
+- Exit 3 (token expired) and exit 4 (device removed) end the process instead of retrying. A
+  remote-assistance host is not on the account, so it is not looked up; its join retries with the
+  same code, which fails once the host withdraws the share.
 - `--no-reconnect`: exit with code 5 when the session ends.
 
 ## 8. Concurrency model
@@ -620,7 +680,8 @@ fails the terminal).
   line that prints a start marker `UUCLI-S-NONCE`, runs COMMAND, and prints an end marker
   `UUCLI-E-NONCE:CODE`. NONCE is 16 random hex digits. Each marker is built by string concatenation
   (`'UU'+'CLI-S-…'`), so the echoed input line never contains it.
-- Shell by the device platform from the device list: `windows` → PowerShell, everything else →
+- Shell by the device platform from the device list (for a remote-assistance host, the join's
+  `publisher_platform`, §6.1): `windows` → PowerShell, everything else →
   POSIX sh.
   - PowerShell: COMMAND is base64 (UTF-8) and run with `Invoke-Expression` inside `try`. CODE is
     `$LASTEXITCODE` if non-zero, else 1 if `$Error` has entries (a failed cmdlet), else 0. The line
@@ -729,6 +790,9 @@ Real-device log:
 | 2026-11-15 | Windows host `proxy` as ssh `ProxyCommand` to `127.0.0.1:22` | passed up to authentication: SYN-ACK ok, SSH key exchange with the host's OpenSSH sshd completed. Login, `scp` and the reconnect check of M2 not run yet. Before this run, a setup failure (host refusing the control request) panicked with a double free in `Session.open`; fixed in `cdd540d` |
 | 2026-11-15 | Windows host `exec` (PowerShell) | passed: plain output, table output (ConPTY cursor positioning), native exit code 3, failing cmdlet → 1 with its error text, parse error → 1, quotes, `--json`. One `exec` per connection, like `terminal` |
 | 2026-11-15 | Windows host `files ls` | no answer within 30 s after session ready (same as the Mac host) |
+| 2026-11-16 | Remote assistance by code to a Windows host of another account | room join (v2 path) passed; `exec hostname` printed the host name, exit 0, PowerShell chosen from `publisher_platform`. Without it the POSIX wrapper reached PowerShell, so tool sessions are allowed in assistance rooms |
+| 2026-11-16 | Same share id, same temporary code, a third join | HTTP 400 code 1131: the code had stopped working (used up or assistance turned off; not distinguished). `files` over assistance not tested yet |
+| 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
 
 ## 13. Open questions and protocol drift
 
@@ -747,6 +811,7 @@ Upstream drift log (append when the pin moves):
 | Date | Upstream version | Change affecting uucli |
 | --- | --- | --- |
 | 2026-11-14 | v0.2.59 | initial pin |
+| 2026-11-16 | `13a40f9` (not pinned) | Viewer `assist CONNECT_ID` joins by share code (`join_share`, §6.1); taken over without moving the pin |
 
 ### Differences from earlier design assumptions
 
