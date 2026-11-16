@@ -44,7 +44,8 @@ const usage_text =
     \\Usage: uucli [-v|-vv] COMMAND [ARGS]
     \\
     \\Commands:
-    \\  login                                   Sign in by scanning a QR code with the UU Remote app
+    \\  login [--qr | --phone]                  Sign in: QR code scanned with the UU Remote app, or phone
+    \\                                          number and SMS code (asked which on a terminal)
     \\  logout                                  Forget the account (keeps the device identity)
     \\  device list [--json]                    List the account's devices
     \\  fav list [--recent] [--json]            List remote-assistance favorites (or recent hosts)
@@ -229,7 +230,12 @@ fn errorExit(app: *App, err: anyerror) Exit {
 }
 
 fn cmdLogin(app: *App, args: []const [:0]const u8) !Exit {
-    if (args.len != 0) return usage(app, "login takes no arguments", .{});
+    var method: ?login.Method = null;
+    for (args) |a| {
+        const m: login.Method = if (eql(a, "--qr")) .qr else if (eql(a, "--phone")) .phone else return usage(app, "expected `login [--qr | --phone]`", .{});
+        if (method != null and method.? != m) return usage(app, "use only one of --qr, --phone", .{});
+        method = m;
+    }
     const path = try app.configPath();
     const account = login.run(.{
         .io = app.io,
@@ -239,6 +245,7 @@ fn cmdLogin(app: *App, args: []const [:0]const u8) !Exit {
         .stderr = app.err,
         .stdin_tty = Io.File.stdin().isTty(app.io) catch false,
         .proxy_env = app.proxyEnv(),
+        .method = method,
     }) catch |err| switch (err) {
         error.LoginBusy => return app.fail(.other, "another `uucli login` is running for {s}", .{path}),
         error.LoginFailed => return app.fail(.other, "login failed", .{}),

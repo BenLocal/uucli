@@ -77,7 +77,7 @@ is a share id, joined by code.
 
 | Command | Milestone | Behavior |
 | --- | --- | --- |
-| `uucli login` | M1 | QR sign-in (§5.3). Prints the QR to stderr. On success prints `Signed in as NAME (USER_ID)` to stderr; stdout stays empty. |
+| `uucli login [--qr \| --phone]` | M1 | QR sign-in (§5.3), or phone number and SMS code (§5.3.1). Without a flag, on a terminal it asks which (`Choice [1]:`, empty = QR, three wrong answers → exit 1); without a terminal it uses QR. Prompts and the QR go to stderr. On success prints `Signed in as NAME (USER_ID)` to stderr; stdout stays empty. |
 | `uucli logout` | M1 | Clears `user_id`, `token`, `csrf`, `account_name`. Keeps the device identity so the next login reuses the same device. Local only, no API call. |
 | `uucli device list [--json]` | M1 | Lists account devices (§5.4). |
 | `uucli fav list [--recent] [--json]` | — | Lists the account's remote-assistance favorites, or with `--recent` the recently connected hosts (§5.5). Columns `ID NAME FAVORITE CODE`; `CODE` is `saved` when a code is in the config. JSON: `[{"id", "name", "favorite", "code_saved"}]`. |
@@ -260,6 +260,22 @@ Upstream: `src/login.rs` `flow`, `qr_poll_action`, `qr_ticket`, `csrf_from_token
 4. `POST /api/v1/login/by_qrcode` with `{"token": TICKET, "qrcode_jump_url": URL}`.
    Save `data.token`, `data.user_id`, `data.nickname` (as `account_name`), and `csrf` = the `csrf` claim
    of the JWT payload (base64url, no padding). Missing token/user_id/csrf → exit 1.
+
+### 5.3.1 Phone login
+
+Source: the official Android app 4.47.0 (requests `/api/v1/security/mobile/code` and
+`/api/v1/login/by_mobile`; region default `86`). Not in upstream.
+
+1. Read the phone number from stdin: digits, spaces and dashes; a leading `+CODE` (1–4 digits)
+   selects the country code, else `86`; 5–15 digits. Three invalid entries → exit 1.
+2. `POST /api/v1/security/mobile/code` with `{"country_code": "86", "mobile": NUMBER, "type": "login"}`.
+   An error → exit 1 with the API code and the server message. The server answers success without
+   checking the number (observed 2026-11-16 for `00000`).
+3. Read the SMS code from stdin (echoed: it is single-use) and
+   `POST /api/v1/login/by_mobile` with `{"country_code": "86", "mobile": NUMBER, "code": CODE}`.
+   An API error (wrong code) asks again, up to three codes; other errors → exit 1. The server message is
+   shown unless it contains the code.
+4. The response is the same as `by_qrcode`'s; it is saved as in §5.3 step 4.
 
 Only one login per config file runs at a time (non-blocking `flock` on `STEM.login.lock`; second run exits 1).
 The login requests carry only the device identity (`client_id`, `system_id`, `device_id`), never an older token.
@@ -793,6 +809,7 @@ Real-device log:
 | 2026-11-15 | Windows host `files ls` | no answer within 30 s after session ready (same as the Mac host) |
 | 2026-11-16 | Remote assistance by code to a Windows host of another account | room join (v2 path) passed; `exec hostname` printed the host name, exit 0, PowerShell chosen from `publisher_platform`. Without it the POSIX wrapper reached PowerShell, so tool sessions are allowed in assistance rooms |
 | 2026-11-16 | Same share id, same temporary code, a third join | HTTP 400 code 1131: the code had stopped working (used up or assistance turned off; not distinguished). `files` over assistance not tested yet |
+| 2026-11-16 | `login` method prompt, `login --phone` input checks, send-code request for `00000` (on a copy of the config) | prompt and checks as specified; the send-code request was accepted (code 0) without validating the number. Receiving an SMS and `by_mobile` with a real number not tested yet |
 | 2026-11-16 | `fav edit` rename and rename back; `fav edit --save-code` on a copy of the config | passed: both lists showed each new remark; the code was saved with mode 0600 |
 | 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
 

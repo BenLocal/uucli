@@ -103,7 +103,11 @@ pub const Context = struct {
     stderr: *Io.Writer,
     stdin_tty: bool,
     proxy_env: ?*const std.process.Environ.Map,
+    /// null: ask on a terminal, else QR.
+    method: ?Method = null,
 };
+
+pub const Method = enum { qr, phone };
 
 pub const Account = struct { name: []const u8, user_id: []const u8 };
 
@@ -120,7 +124,41 @@ pub fn run(ctx: Context) !Account {
     defer id_lock.release(ctx.io);
 
     var cfg = try prepareDevice(ctx);
-    return flow(ctx, &cfg);
+    const method = ctx.method orelse if (ctx.stdin_tty) try chooseMethod(ctx) else .qr;
+    return switch (method) {
+        .qr => flow(ctx, &cfg),
+        .phone => phoneFlow(ctx, &cfg),
+    };
+}
+
+fn chooseMethod(ctx: Context) !Method {
+    try ctx.stderr.writeAll("Sign in with:\n  1) QR code (scan with the UU Remote app)\n  2) Phone number and SMS code\n");
+    for (0..3) |_| {
+        const a = try readLine(ctx, "Choice [1]: ");
+        if (a.len == 0 or std.mem.eql(u8, a, "1")) return .qr;
+        if (std.mem.eql(u8, a, "2")) return .phone;
+        try ctx.stderr.writeAll("Enter 1 or 2\n");
+    }
+    return error.LoginFailed;
+}
+
+/// Prints `prompt` and reads one line of stdin, trimmed. One byte at a time, so nothing after the
+/// line is consumed. End of input before a line → LoginFailed.
+fn readLine(ctx: Context, prompt: []const u8) ![]const u8 {
+    try ctx.stderr.writeAll(prompt);
+    try ctx.stderr.flush();
+    var buf: [1]u8 = undefined;
+    var r = Io.File.stdin().readerStreaming(ctx.io, &buf);
+    var line: std.ArrayList(u8) = .empty;
+    while (true) {
+        const b = r.interface.takeByte() catch {
+            if (line.items.len == 0) return error.LoginFailed;
+            break;
+        };
+        if (b == '\n') break;
+        if (line.items.len < 256) try line.append(ctx.arena, b);
+    }
+    return std.mem.trim(u8, line.items, " \t\r");
 }
 
 /// Loads the config, generates missing ids and registers the device if it has no `device_id`.
@@ -291,8 +329,14 @@ fn finish(ctx: Context, cfg: *Config, client: *api.Client, ticket: []const u8, u
         return error.LoginFailed;
     };
     defer resp.deinit();
-    const token = api.str(resp.data, "token") orelse "";
-    const user = api.str(resp.data, "user_id") orelse "";
+    return saveLogin(ctx, cfg, resp.data);
+}
+
+/// Stores the account from a sign-in response (`by_qrcode` and `by_mobile` answer alike).
+fn saveLogin(ctx: Context, cfg: *Config, data: std.json.Value) !Account {
+    const w = ctx.stderr;
+    const token = api.str(data, "token") orelse "";
+    const user = api.str(data, "user_id") orelse "";
     if (token.len == 0 or user.len == 0) {
         try w.writeAll("sign-in response has no token or user_id\n");
         return error.LoginFailed;
@@ -304,9 +348,79 @@ fn finish(ctx: Context, cfg: *Config, client: *api.Client, ticket: []const u8, u
     cfg.token = try ctx.arena.dupe(u8, token);
     cfg.user_id = try ctx.arena.dupe(u8, user);
     cfg.csrf = csrf;
-    cfg.account_name = try ctx.arena.dupe(u8, api.str(resp.data, "nickname") orelse "");
+    cfg.account_name = try ctx.arena.dupe(u8, api.str(data, "nickname") orelse "");
     try config.save(ctx.io, ctx.config_path, cfg.*);
     return .{ .name = cfg.account_name, .user_id = cfg.user_id };
+}
+
+pub const Phone = struct { country_code: []const u8, number: []const u8 };
+
+/// `13800000000` (country code 86) or `+852 1234 5678`. Spaces and dashes in the number are
+/// dropped; anything else that is not a digit → null.
+pub fn parsePhone(arena: Allocator, input: []const u8) Allocator.Error!?Phone {
+    var s = std.mem.trim(u8, input, " ");
+    var cc: []const u8 = "86";
+    if (s.len != 0 and s[0] == '+') {
+        var n: usize = 1;
+        while (n < s.len and std.ascii.isDigit(s[n])) n += 1;
+        cc = s[1..n];
+        s = s[n..];
+        if (cc.len == 0 or cc.len > 4) return null;
+    }
+    var digits: std.ArrayList(u8) = .empty;
+    for (s) |b| {
+        if (std.ascii.isDigit(b)) try digits.append(arena, b) else if (b != ' ' and b != '-') return null;
+    }
+    if (digits.items.len < 5 or digits.items.len > 15) return null;
+    return .{ .country_code = cc, .number = digits.items };
+}
+
+/// Phone number and SMS code, as the official Android app signs in (spec §5.3.1).
+fn phoneFlow(ctx: Context, cfg: *Config) !Account {
+    const w = ctx.stderr;
+    var anon = cfg.*;
+    anon.clearAccount();
+    var client: api.Client = undefined;
+    try initClient(ctx, &client, &anon);
+    defer client.deinit();
+
+    const phone = for (0..3) |_| {
+        if (try parsePhone(ctx.arena, try readLine(ctx, "Phone number (+CODE first outside mainland China): "))) |p| break p;
+        try w.writeAll("Not a phone number\n");
+    } else return error.LoginFailed;
+
+    const send = try std.json.Stringify.valueAlloc(ctx.arena, .{ .country_code = phone.country_code, .mobile = phone.number, .type = "login" }, .{});
+    var sent = client.call(.POST, "/api/v1/security/mobile/code", send, qr_timeout) catch |err| {
+        reportPhoneError(w, "sending the SMS code", &client, err, "");
+        return error.LoginFailed;
+    };
+    sent.deinit();
+    try w.print("SMS code sent to +{s} {s}\n", .{ phone.country_code, phone.number });
+
+    for (0..3) |_| {
+        const code = try readLine(ctx, "SMS code: ");
+        if (code.len == 0) continue;
+        const body = try std.json.Stringify.valueAlloc(ctx.arena, .{ .country_code = phone.country_code, .mobile = phone.number, .code = code }, .{});
+        var resp = client.call(.POST, "/api/v1/login/by_mobile", body, qr_timeout) catch |err| {
+            reportPhoneError(w, "phone sign-in", &client, err, code);
+            // A wrong code can be typed again; anything else ends the login.
+            if (err == error.ApiError) continue;
+            return error.LoginFailed;
+        };
+        defer resp.deinit();
+        return saveLogin(ctx, cfg, resp.data);
+    }
+    return error.LoginFailed;
+}
+
+/// Like `reportCallError`, plus the server message (it says why: wrong code, too many requests),
+/// unless it quotes the SMS code.
+fn reportPhoneError(w: *Io.Writer, what: []const u8, client: *api.Client, err: anyerror, code: []const u8) void {
+    if (err != error.ApiError) return reportCallError(w, what, client, err);
+    const f = &client.failure;
+    const show = f.msg_len != 0 and (code.len == 0 or std.mem.indexOf(u8, f.msg(), code) == null);
+    w.print("{s} failed: {f}{s}{s}\n", .{ what, f.*, if (show) ": " else "", if (show) f.msg() else "" }) catch {};
+    w.flush() catch {};
 }
 
 /// On a tty: wait for Enter. Otherwise stop the login.
@@ -555,6 +669,20 @@ test "status ticket prefers status_query_ticket" {
     try testing.expectEqualStrings("new", qrTicket(try parse(ar, "{\"token\":\"old\",\"status_query_ticket\":\"new\"}")).?);
     try testing.expectEqualStrings("old", qrTicket(try parse(ar, "{\"token\":\"old\"}")).?);
     try testing.expect(qrTicket(try parse(ar, "{\"status_query_ticket\":\"\"}")) == null);
+}
+
+test "parsePhone" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const cn = (try parsePhone(ar, " 138-0000 0000 ")).?;
+    try testing.expectEqualStrings("86", cn.country_code);
+    try testing.expectEqualStrings("13800000000", cn.number);
+    const hk = (try parsePhone(ar, "+852 1234 5678")).?;
+    try testing.expectEqualStrings("852", hk.country_code);
+    try testing.expectEqualStrings("12345678", hk.number);
+    for ([_][]const u8{ "", "+", "+12345 6789012", "1234", "1380000000a", "+86", "1234567890123456" }) |bad|
+        try testing.expectEqual(@as(?Phone, null), try parsePhone(ar, bad));
 }
 
 test "csrf is read from the JWT payload" {

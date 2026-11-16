@@ -33,10 +33,13 @@ archives need a macOS host with the SDK installed.
 ## Sign in
 
 ```sh
-uucli login          # scan the QR code with the UU Remote app
+uucli login          # asks: QR code (scan with the UU Remote app) or phone number + SMS code
+uucli login --phone  # phone number + SMS code; --qr for the QR code
 uucli device list    # ID, NAME, PLATFORM, ONLINE, SHARED
 uucli logout
 ```
+
+For a number outside mainland China, type the country code first, e.g. `+852 12345678`.
 
 uucli registers itself as a device on your account. The config, including the login token, is
 stored at `$XDG_CONFIG_HOME/uucli/config.json` (or `~/.config/uucli/config.json`, or
