@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Release archives (spec §11.3) for a pushed tag vVERSION. Linux is built on Linux; the macOS
+# targets need the SDK, so they are built on a macOS runner and do not block a Linux release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches build.zig version
+        run: |
+          v=$(sed -n 's/^const version = "\(.*\)";$/\1/p' build.zig)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match build.zig version $v"; exit 1
+          fi
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig build test
+      - run: zig build release -Drelease-os=linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: zig-out/release/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig build release -Drelease-os=macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: zig-out/release/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, macos]
+    # macOS is best effort: publish whenever the Linux archives exist.
+    if: ${{ !cancelled() && needs.linux.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "uucli $GITHUB_REF_NAME" --generate-notes

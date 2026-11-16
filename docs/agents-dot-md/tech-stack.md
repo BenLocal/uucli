@@ -37,6 +37,7 @@ zig fmt --check build.zig build.zig.zon src tests  # CI 的 lint 步骤，必须
 ```
 
 - 全仓已按 Zig 0.17.1 的 `zig fmt` 统一格式（2026-11-16，包括 `@intFromEnum` → `@backingInt` 这类改名），CI 的 lint 任务跑 `zig fmt --check`，不通过就失败。提交前对改动的文件跑一次 `zig fmt`。
+- CI：`.github/workflows/ci.yml` 在每次 push 和 PR 时跑 lint（fmt、SPDX 头）、Ubuntu 构建 + 测试 + aarch64 交叉编译、macOS 构建 + 测试。发布：推 `vVERSION` 标签触发 `release.yml`，标签必须等于 `build.zig` 的 `version`；Linux 包在 Ubuntu 上构建，macOS 包在 macOS runner 上构建且失败不阻塞发布，产物带 `SHA256SUMS`。
 - `zig build test` 偶尔会在输出里打一行 `failed command: …`，但退出码是 0、汇总 15/15 成功；以退出码和 `--summary all` 为准。
 - macOS 目标的 release 构建需要在装了 SDK 的 macOS 上跑（usrsctp 依赖 SDK 头文件）。
 

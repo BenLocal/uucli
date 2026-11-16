@@ -767,6 +767,11 @@ counter starting at 100. Result codes: 1 = success, anything else → exit 6 wit
   `zig-out/release/uucli-VERSION-ARCH-OS.tar.gz`, each with `uucli`, README, LICENSE, NOTICE and the
   systemd unit. The macOS targets need a macOS host with the SDK (usrsctp uses SDK-only headers).
   `-Drelease-os=linux` or `macos` builds only that OS's archives.
+- GitHub Actions: `ci.yml` (every push and pull request) runs `zig fmt --check`, the SPDX header
+  check, build + tests on Ubuntu and macOS, and an aarch64-linux-musl cross build. `release.yml`
+  runs for a pushed tag `vVERSION` that equals `build.zig`'s version: Linux archives on Ubuntu, macOS
+  archives on a macOS runner (best effort: a failure does not hold back the Linux release), then a
+  GitHub release with the archives and `SHA256SUMS`.
 - `contrib/systemd/uucli-portmap@.service`: user unit; instance `NAME` reads
   `~/.config/uucli/portmap-NAME.env` (`UUCLI_DEVICE`, `UUCLI_FORWARDS`), restarts on failure after
   30 s. Reconnects while the host is away are uucli's own (§7.1); SIGTERM stops it with exit 0.

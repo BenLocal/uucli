@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Lint, build and test on every push and pull request (spec §2: Zig 0.17.1).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: zig fmt --check
+        run: zig fmt --check build.zig build.zig.zon src tests
+      - name: SPDX headers
+        run: |
+          missing=$(git ls-files '*.zig' '*.h' '*.c' | xargs grep -L SPDX-License-Identifier || true)
+          if [ -n "$missing" ]; then echo "missing SPDX header:"; echo "$missing"; exit 1; fi
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Build
+        run: zig build
+      - name: Test
+        run: zig build test --summary all
+      - name: Cross-build aarch64 Linux (musl, static)
+        run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Build
+        run: zig build
+      - name: Test
+        run: zig build test --summary all
