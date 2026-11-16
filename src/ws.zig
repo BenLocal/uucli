@@ -81,7 +81,7 @@ pub const Socket = struct {
         try req.sendBodiless();
         const response = try req.receiveHead(&.{});
         if (response.head.status != .switching_protocols) {
-            log.warn("websocket upgrade refused: http {d}", .{@intFromEnum(response.head.status)});
+            log.warn("websocket upgrade refused: http {d}", .{@backingInt(response.head.status)});
             return error.HandshakeFailed;
         }
         try verifyUpgrade(response.head.iterateHeaders(), &key);
@@ -135,7 +135,7 @@ pub const Socket = struct {
             const b1 = try r.takeByte();
             const fin = b0 & 0x80 != 0;
             if (b0 & 0x70 != 0) return error.ProtocolError; // no extensions negotiated
-            const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0)));
+            const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0))));
             if (b1 & 0x80 != 0) return error.ProtocolError; // servers never mask
             var len: u64 = b1 & 0x7f;
             if (len == 126) len = try r.takeInt(u16, .big) else if (len == 127) len = try r.takeInt(u64, .big);
@@ -174,7 +174,7 @@ pub const Socket = struct {
 
 /// Frame header for a masked client frame; returns its length.
 pub fn encodeHeader(out: *[14]u8, opcode: Opcode, len: usize, mask: [4]u8) usize {
-    out[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+    out[0] = 0x80 | @as(u8, @backingInt(opcode));
     var n: usize = 2;
     if (len < 126) {
         out[1] = 0x80 | @as(u8, @intCast(len));
@@ -292,7 +292,7 @@ pub const TestServer = struct {
 
 /// Writes one unmasked server frame.
 pub fn testServerFrame(w: *Io.Writer, fin: bool, opcode: Opcode, payload: []const u8) !void {
-    try w.writeByte((if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode));
+    try w.writeByte((if (fin) @as(u8, 0x80) else 0) | @backingInt(opcode));
     if (payload.len < 126) {
         try w.writeByte(@intCast(payload.len));
     } else if (payload.len <= 0xffff) {
@@ -316,7 +316,7 @@ pub fn testReadClientFrame(r: *Io.Reader, buf: []u8) !struct { opcode: Opcode, d
     const data = buf[0..@intCast(len)];
     try r.readSliceAll(data);
     for (data, 0..) |*c, i| c.* ^= mask[i & 3];
-    return .{ .opcode = @enumFromInt(@as(u4, @truncate(b0))), .data = data };
+    return .{ .opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0)))), .data = data };
 }
 
 fn serverScript(t: *TestServer, io: Io, seen: *[64]u8, seen_len: *usize) void {

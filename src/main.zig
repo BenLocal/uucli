@@ -23,7 +23,7 @@ pub const std_options: std.Options = .{ .log_level = .debug, .logFn = logFn };
 var log_level: std.log.Level = .warn;
 
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
-    if (@intFromEnum(level) > @intFromEnum(log_level)) return;
+    if (@backingInt(level) > @backingInt(log_level)) return;
     std.log.defaultLog(level, scope, format, args);
 }
 
@@ -131,11 +131,11 @@ pub fn main(init: std.process.Init) u8 {
         .out = &out_w.interface,
         .err = &err_w.interface,
     };
-    const args = init.minimal.args.toSlice(app.arena) catch return @intFromEnum(Exit.other);
+    const args = init.minimal.args.toSlice(app.arena) catch return @backingInt(Exit.other);
     const code = run(&app, args[1..]);
     app.out.flush() catch {};
     app.err.flush() catch {};
-    return @intFromEnum(code);
+    return @backingInt(code);
 }
 
 fn run(app: *App, all_args: []const [:0]const u8) Exit {
@@ -752,7 +752,7 @@ const LoopSetup = struct {
 };
 
 fn interruptedExit() Exit {
-    return @enumFromInt(interrupts.exitCode());
+    return @fromBackingInt(@intCast(interrupts.exitCode()));
 }
 
 /// Opens sessions for the port mapper until interrupted (spec §7.1).
@@ -1132,7 +1132,7 @@ fn execWorker(app: *App, cmd: *ExecCmd) Exit {
         app.out.writeByte('\n') catch {};
     } else app.out.writeAll(r.output) catch {};
     // Statuses outside 0..255 (Windows NTSTATUS values, negative numbers) become 1.
-    return if (r.code >= 0 and r.code <= 255) @enumFromInt(r.code) else .other;
+    return if (r.code >= 0 and r.code <= 255) @fromBackingInt(@intCast(r.code)) else .other;
 }
 
 fn terminalWorker(app: *App, cmd: *TerminalCmd) Exit {

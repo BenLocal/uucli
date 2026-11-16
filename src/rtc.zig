@@ -114,7 +114,7 @@ fn onCandidate(pc: c_int, cand: [*c]const u8, mid: [*c]const u8, ptr: ?*anyopaqu
 }
 
 fn onState(pc: c_int, state: c.rtcState, ptr: ?*anyopaque) callconv(.c) void {
-    hubOf(ptr).push(.{ .state = .{ .pc = pc, .state = @enumFromInt(state) } });
+    hubOf(ptr).push(.{ .state = .{ .pc = pc, .state = @fromBackingInt(@intCast(state)) } });
 }
 
 fn onDataChannel(pc: c_int, dc: c_int, ptr: ?*anyopaque) callconv(.c) void {

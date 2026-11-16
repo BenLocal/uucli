@@ -14,7 +14,7 @@ pub const ResizeHook = struct { ptr: *anyopaque, call: *const fn (ptr: *anyopaqu
 var resize_hook: ?ResizeHook = null;
 
 fn handler(sig: std.c.SIG) callconv(.c) void {
-    if (sig != .WINCH) last_signal.store(@intCast(@intFromEnum(sig)), .release);
+    if (sig != .WINCH) last_signal.store(@intCast(@backingInt(sig)), .release);
     const b: [1]u8 = .{if (sig == .WINCH) 1 else 0};
     _ = std.c.write(pipe_fds[1], &b, 1);
 }
@@ -66,7 +66,7 @@ pub fn onResize(hook: ?ResizeHook) void {
 /// The signal that caused the last `.interrupt`, if any.
 pub fn last() ?std.c.SIG {
     const v = last_signal.load(.acquire);
-    return if (v == 0) null else @enumFromInt(v);
+    return if (v == 0) null else @fromBackingInt(@intCast(v));
 }
 
 /// Exit code for an interrupt: SIGTERM 0, anything else 130.

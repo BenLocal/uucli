@@ -36,8 +36,13 @@ test "vectors: build_headers" {
     for (root.object.get("headers").?.array.items) |v| {
         const c = v.object.get("config").?;
         const cfg: Config = .{
-            .client_id = s(c, "client_id"), .system_id = s(c, "system_id"), .device_id = s(c, "device_id"),
-            .user_id = s(c, "user_id"), .token = s(c, "token"), .csrf = s(c, "csrf"), .sign_key = s(c, "sign_key"),
+            .client_id = s(c, "client_id"),
+            .system_id = s(c, "system_id"),
+            .device_id = s(c, "device_id"),
+            .user_id = s(c, "user_id"),
+            .token = s(c, "token"),
+            .csrf = s(c, "csrf"),
+            .sign_key = s(c, "sign_key"),
         };
         const want = v.object.get("headers").?.object;
         const ts = try std.fmt.parseInt(i64, want.get("x-param-ts").?.string, 10);
@@ -89,9 +94,7 @@ test "vectors: qr_poll_action" {
         const want = v.object.get("action").?;
         const ok = switch (want) {
             .string => |t| (std.mem.eql(u8, t, "scanned") and got == .scanned) or (std.mem.eql(u8, t, "confirmed") and got == .confirmed),
-            .object => |o| if (o.get("wait")) |w| got == .wait and got.wait == w.integer
-                else if (o.get("refresh")) |r| got == .refresh and got.refresh == r.integer
-                else got == .failed and std.mem.eql(u8, @tagName(got.failed), o.get("failed").?.string),
+            .object => |o| if (o.get("wait")) |w| got == .wait and got.wait == w.integer else if (o.get("refresh")) |r| got == .refresh and got.refresh == r.integer else got == .failed and std.mem.eql(u8, @tagName(got.failed), o.get("failed").?.string),
             else => false,
         };
         if (!ok) {

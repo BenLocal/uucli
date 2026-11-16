@@ -275,7 +275,7 @@ pub const Client = struct {
                         return error.Network;
                     },
                 };
-                return @intFromEnum(res.status);
+                return @backingInt(res.status);
             },
         }
     }
@@ -640,12 +640,12 @@ test "buildHeaders with token" {
     try testing.expectEqualStrings("X", h.get("x-csrf-token").?);
     try testing.expectEqualStrings("u", h.get("x-param-user-id").?);
     const params = [_]Param{
-        .{ .name = "x-param-plat", .value = "1" },         .{ .name = "x-param-vn", .value = "4.42.0.2770" },
-        .{ .name = "x-param-vc", .value = "2770" },        .{ .name = "x-param-pkgn", .value = "com.netease.gameviewer" },
-        .{ .name = "x-param-chn", .value = "gwqd" },       .{ .name = "x-param-lang", .value = "zh-CN" },
-        .{ .name = "x-param-cnt", .value = "CN" },         .{ .name = "x-param-client-id", .value = "c" },
-        .{ .name = "x-param-device-id", .value = "d" },    .{ .name = "x-param-system-id", .value = "S" },
-        .{ .name = "x-param-user-id", .value = "u" },      .{ .name = "x-param-ts", .value = "1" },
+        .{ .name = "x-param-plat", .value = "1" },      .{ .name = "x-param-vn", .value = "4.42.0.2770" },
+        .{ .name = "x-param-vc", .value = "2770" },     .{ .name = "x-param-pkgn", .value = "com.netease.gameviewer" },
+        .{ .name = "x-param-chn", .value = "gwqd" },    .{ .name = "x-param-lang", .value = "zh-CN" },
+        .{ .name = "x-param-cnt", .value = "CN" },      .{ .name = "x-param-client-id", .value = "c" },
+        .{ .name = "x-param-device-id", .value = "d" }, .{ .name = "x-param-system-id", .value = "S" },
+        .{ .name = "x-param-user-id", .value = "u" },   .{ .name = "x-param-ts", .value = "1" },
     };
     try testing.expectEqualStrings(&sign("custom", "GET", "/api/v1/device/list", &params, ""), h.get("X-Param-SIGN").?);
 }

@@ -509,7 +509,7 @@ pub const Session = struct {
             .local_description => |d| if (d.pc == pc) s.sendOffer(d.sdp, d.kind),
             .local_candidate => |d| if (d.pc == pc) s.sendCandidate(d.candidate),
             .state => |st| if (st.pc == pc) {
-                log.info("peer connection state: {d}", .{@intFromEnum(st.state)});
+                log.info("peer connection state: {d}", .{@backingInt(st.state)});
                 if (st.state == .failed or st.state == .closed) {
                     if (s.ready) s.ended = .peer_failed else s.fail(error.ConnectFailed, "ICE/DTLS connection failed", .{});
                 }
