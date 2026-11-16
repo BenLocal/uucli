@@ -37,7 +37,9 @@ fn readerThread() void {
 pub fn install(bus: *Bus) !void {
     target = bus;
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
-    const t = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, readerThread, .{});
+    // Default stack size: glibc carves static TLS (std's 256 KiB signal stack) out of the thread
+    // stack, so a small explicit size makes pthread_create fail with EINVAL on Linux.
+    const t = try std.Thread.spawn(.{}, readerThread, .{});
     t.detach();
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = handler },
@@ -70,4 +72,21 @@ pub fn last() ?std.c.SIG {
 /// Exit code for an interrupt: SIGTERM 0, anything else 130.
 pub fn exitCode() u8 {
     return if (last() == .TERM) 0 else 130;
+}
+
+test "install starts the reader thread and delivers SIGTERM to the bus" {
+    const io = std.testing.io;
+    var buf: [16]@import("session.zig").Event = undefined;
+    var bus: Bus = undefined;
+    try bus.init(io, &buf);
+    defer bus.deinit();
+    try install(&bus);
+    defer target = null;
+    _ = std.c.raise(.TERM);
+    while (true) {
+        const e = try bus.next();
+        defer e.deinit();
+        if (e == .interrupt) break;
+    }
+    try std.testing.expectEqual(@as(u8, 0), exitCode());
 }
