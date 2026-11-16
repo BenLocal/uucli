@@ -67,5 +67,6 @@
 ## 🧠 记忆索引（docs/memory/，脚本生成）
 <!-- MEMORY:START -->
 - [实机验证经验](docs/memory/real-device-testing.md) — 对官方 Windows / Mac 被控端做实机验证时踩过的坑：被控端状态、主控端互斥、解锁、官方 CLI 对照。
+- [Zig 运行时踩坑](docs/memory/zig-runtime.md) — Zig 0.17 程序在不同平台上跑起来才暴露的问题：线程、TLS、信号。
 - [Zig 测试踩坑](docs/memory/zig-testing.md) — Zig 0.17 测试运行器的非显然行为：error 级日志算失败、输出里的 failed command 怎么读。
 <!-- MEMORY:END -->
