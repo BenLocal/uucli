@@ -766,6 +766,7 @@ counter starting at 100. Result codes: 1 = success, anything else → exit 6 wit
   static) and x86_64 / aarch64 macOS (libSystem only) and writes
   `zig-out/release/uucli-VERSION-ARCH-OS.tar.gz`, each with `uucli`, README, LICENSE, NOTICE and the
   systemd unit. The macOS targets need a macOS host with the SDK (usrsctp uses SDK-only headers).
+  `-Drelease-os=linux` or `macos` builds only that OS's archives.
 - `contrib/systemd/uucli-portmap@.service`: user unit; instance `NAME` reads
   `~/.config/uucli/portmap-NAME.env` (`UUCLI_DEVICE`, `UUCLI_FORWARDS`), restarts on failure after
   30 s. Reconnects while the host is away are uucli's own (§7.1); SIGTERM stops it with exit 0.

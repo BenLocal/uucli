@@ -32,6 +32,7 @@ zig build test --summary all     # 看每个步骤是否成功
 zig build test -Dtest-filter=名字 # 只跑名字含该字符串的测试
 zig build -Doptimize=ReleaseSafe # 发布构建
 zig build release                # 4 个平台的 tar.gz，写到 zig-out/release/
+zig build release -Drelease-os=linux  # 只打 Linux 的两个包（CI 在 Linux runner 上这样用）
 zig fmt --check build.zig build.zig.zon src tests  # CI 的 lint 步骤，必须通过
 ```
 

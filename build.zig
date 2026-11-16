@@ -22,6 +22,8 @@ pub fn build(b: *std.Build) void {
 
     // Release archives (spec §11.3): zig-out/release/uucli-VERSION-ARCH-OS.tar.gz
     const release = b.step("release", "Build static release archives for Linux and macOS");
+    // CI builds Linux on a Linux runner and macOS on a macOS runner (the macOS targets need the SDK).
+    const release_os = b.option(std.Target.Os.Tag, "release-os", "Only build the release archives for this OS (linux, macos)");
     const release_targets = [_]std.Target.Query{
         .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
         .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
@@ -29,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     };
     for (release_targets) |q| {
+        if (release_os) |os| if (q.os_tag.? != os) continue;
         const t = b.resolveTargetQuery(q);
         const name = b.fmt("uucli-{s}-{s}-{s}", .{ version, @tagName(q.cpu_arch.?), @tagName(q.os_tag.?) });
         const rexe = addUucli(b, t, .ReleaseSafe, false);
