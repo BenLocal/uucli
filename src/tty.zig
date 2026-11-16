@@ -18,9 +18,9 @@ fn getAttr(fd: posix.fd_t) !posix.termios {
     };
 }
 
-fn setAttr(fd: posix.fd_t, t: posix.termios) !void {
-    if (builtin.os.tag != .linux) return posix.tcsetattr(fd, .NOW, t);
-    return switch (linux.errno(linux.tcsetattr(fd, .NOW, &t))) {
+fn setAttr(fd: posix.fd_t, when: posix.TCSA, t: posix.termios) !void {
+    if (builtin.os.tag != .linux) return posix.tcsetattr(fd, when, t);
+    return switch (linux.errno(linux.tcsetattr(fd, when, &t))) {
         .SUCCESS => {},
         .NOTTY => error.NotATerminal,
         else => error.Unexpected,
@@ -31,7 +31,8 @@ pub const Raw = struct {
     fd: posix.fd_t,
     saved: posix.termios,
 
-    /// Puts `fd` into raw mode (like cfmakeraw); `restore` undoes it.
+    /// Puts `fd` into raw mode (like cfmakeraw); `restore` undoes it. Input typed before is dropped:
+    /// in cooked mode Enter became LF, which a Windows host reads as Ctrl+Enter.
     pub fn enter(fd: posix.fd_t) !Raw {
         const saved = try getAttr(fd);
         var raw = saved;
@@ -53,7 +54,7 @@ pub const Raw = struct {
         raw.cflag.PARENB = false;
         raw.cc[@intFromEnum(posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
-        try setAttr(fd, raw);
+        try setAttr(fd, .FLUSH, raw);
         return .{ .fd = fd, .saved = saved };
     }
 
@@ -62,12 +63,12 @@ pub const Raw = struct {
         const saved = try getAttr(fd);
         var t = saved;
         t.lflag.ECHO = false;
-        try setAttr(fd, t);
+        try setAttr(fd, .NOW, t);
         return .{ .fd = fd, .saved = saved };
     }
 
     pub fn restore(r: Raw) void {
-        setAttr(r.fd, r.saved) catch {};
+        setAttr(r.fd, .NOW, r.saved) catch {};
     }
 };
 
