@@ -720,8 +720,10 @@ fails the terminal).
 Upstream: `src/viewer/tools/files.rs`, host side `src/file_trans.rs`. Session capture type 5.
 
 uucli's requests are `rpc(rid, request, CASE, BODY)` (§6.5 `rpc`, field 8) on CONTROL; the answer is
-the rpc response with the same `rid` whose field 4 holds the expected case. Replies arrive on FILE or
-CONTROL. `ID(task, index)` is field `1: {1: task, 2: index}`. Request ids and task ids share one
+the rpc response with the same `rid` whose field 4 holds the expected case. Replies arrive on FILE,
+CONTROL or TEXT. The official Windows host sends them as WebRTC *text* messages although they are
+binary protobuf (zlib listings contain NUL bytes): the length is libdatachannel's `-(size + 1)`,
+never `strlen` (which cut listings and made every non-root `ls` time out until 2026-11-16). `ID(task, index)` is field `1: {1: task, 2: index}`. Request ids and task ids share one
 counter starting at 100. Result codes: 1 = success, anything else → exit 6 with the code
 (`FT_*`: 4 permission, 5 disk, 6 I/O, 7 canceled, 9 not found). Each reply is awaited ≤ 30 s.
 
@@ -807,6 +809,8 @@ Real-device log:
 | 2026-11-15 | Windows host `proxy` as ssh `ProxyCommand` to `127.0.0.1:22` | passed up to authentication: SYN-ACK ok, SSH key exchange with the host's OpenSSH sshd completed. Login, `scp` and the reconnect check of M2 not run yet. Before this run, a setup failure (host refusing the control request) panicked with a double free in `Session.open`; fixed in `cdd540d` |
 | 2026-11-15 | Windows host `exec` (PowerShell) | passed: plain output, table output (ConPTY cursor positioning), native exit code 3, failing cmdlet → 1 with its error text, parse error → 1, quotes, `--json`. One `exec` per connection, like `terminal` |
 | 2026-11-15 | Windows host `files ls` | no answer within 30 s after session ready (same as the Mac host) |
+| 2026-11-16 | Windows host `files ls` | `C:\` listed; every subdirectory timed out. The host did answer: its rpc response came as a text message with NUL bytes, and uucli cut it at the first NUL. Fixed; then three subdirectories listed (up to 106 entries) |
+| 2026-11-16 | Windows host `files put` / `get` of a 20 MB file | passed after the fix: sha256 match; put 45 s, get 10 s; `put` of an existing name without `--force` → exit 2. The > 1 GB and > 5000-entry checks of M4 not run yet |
 | 2026-11-16 | Remote assistance by code to a Windows host of another account | room join (v2 path) passed; `exec hostname` printed the host name, exit 0, PowerShell chosen from `publisher_platform`. Without it the POSIX wrapper reached PowerShell, so tool sessions are allowed in assistance rooms |
 | 2026-11-16 | Same share id, same temporary code, a third join | HTTP 400 code 1131: the code had stopped working (used up or assistance turned off; not distinguished). `files` over assistance not tested yet |
 | 2026-11-16 | `login` method prompt, `login --phone` input checks, send-code request for `00000` (on a copy of the config) | prompt and checks as specified; the send-code request was accepted (code 0) without validating the number. Receiving an SMS and `by_mobile` with a real number not tested yet |

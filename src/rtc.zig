@@ -136,11 +136,16 @@ fn onError(id: c_int, message: [*c]const u8, ptr: ?*anyopaque) callconv(.c) void
     hubOf(ptr).push(.{ .@"error" = .{ .id = id, .message = m } });
 }
 
+/// The bytes of a message callback. libdatachannel passes -(length + 1) for text messages. Not
+/// strlen: the official Windows host sends binary protobuf (e.g. zlib directory listings) as text,
+/// NUL bytes included.
+fn messageBytes(message: [*c]const u8, size: c_int) []const u8 {
+    return message[0..@intCast(if (size >= 0) size else -size - 1)];
+}
+
 fn onMessage(id: c_int, message: [*c]const u8, size: c_int, ptr: ?*anyopaque) callconv(.c) void {
-    // libdatachannel passes size < 0 for text messages (NUL-terminated).
     const binary = size >= 0;
-    const bytes: []const u8 = if (binary) message[0..@intCast(size)] else std.mem.span(message);
-    const data = heap.dupe(u8, bytes) catch return;
+    const data = heap.dupe(u8, messageBytes(message, size)) catch return;
     hubOf(ptr).push(.{ .message = .{ .dc = id, .data = data, .binary = binary } });
 }
 
@@ -266,4 +271,11 @@ pub fn loopback(io: Io) !void {
             .data_channel, .closed, .@"error" => {},
         }
     }
+}
+
+test "text messages keep their NUL bytes" {
+    const text = "a\x00b\x00";
+    try std.testing.expectEqualStrings("a\x00b", messageBytes(text, -4));
+    try std.testing.expectEqualStrings("a\x00", messageBytes(text, 2));
+    try std.testing.expectEqualStrings("", messageBytes(text, -1));
 }
