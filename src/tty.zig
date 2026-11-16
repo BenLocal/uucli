@@ -1,7 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Local terminal: raw mode and window size (spec §11.1).
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
+const linux = std.os.linux;
+
+/// tcgetattr. On Linux the ioctl itself: Zig 0.17.1's `posix.termios` is the kernel's 44-byte struct,
+/// but glibc's tcgetattr writes its own 60-byte one and overruns it (a stack-protector abort in
+/// ReleaseSafe).
+fn getAttr(fd: posix.fd_t) !posix.termios {
+    if (builtin.os.tag != .linux) return posix.tcgetattr(fd);
+    var t: posix.termios = undefined;
+    return switch (linux.errno(linux.tcgetattr(fd, &t))) {
+        .SUCCESS => t,
+        .NOTTY => error.NotATerminal,
+        else => error.Unexpected,
+    };
+}
+
+fn setAttr(fd: posix.fd_t, t: posix.termios) !void {
+    if (builtin.os.tag != .linux) return posix.tcsetattr(fd, .NOW, t);
+    return switch (linux.errno(linux.tcsetattr(fd, .NOW, &t))) {
+        .SUCCESS => {},
+        .NOTTY => error.NotATerminal,
+        else => error.Unexpected,
+    };
+}
 
 pub const Raw = struct {
     fd: posix.fd_t,
@@ -9,7 +33,7 @@ pub const Raw = struct {
 
     /// Puts `fd` into raw mode (like cfmakeraw); `restore` undoes it.
     pub fn enter(fd: posix.fd_t) !Raw {
-        const saved = try posix.tcgetattr(fd);
+        const saved = try getAttr(fd);
         var raw = saved;
         raw.iflag.IGNBRK = false;
         raw.iflag.BRKINT = false;
@@ -29,21 +53,21 @@ pub const Raw = struct {
         raw.cflag.PARENB = false;
         raw.cc[@intFromEnum(posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
-        try posix.tcsetattr(fd, .NOW, raw);
+        try setAttr(fd, raw);
         return .{ .fd = fd, .saved = saved };
     }
 
     /// Turns off echo only (for reading a secret line); `restore` undoes it.
     pub fn noEcho(fd: posix.fd_t) !Raw {
-        const saved = try posix.tcgetattr(fd);
+        const saved = try getAttr(fd);
         var t = saved;
         t.lflag.ECHO = false;
-        try posix.tcsetattr(fd, .NOW, t);
+        try setAttr(fd, t);
         return .{ .fd = fd, .saved = saved };
     }
 
     pub fn restore(r: Raw) void {
-        posix.tcsetattr(r.fd, .NOW, r.saved) catch {};
+        setAttr(r.fd, r.saved) catch {};
     }
 };
 
