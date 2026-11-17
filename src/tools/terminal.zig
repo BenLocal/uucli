@@ -6,7 +6,6 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const wire = @import("../wire.zig");
 const session_mod = @import("../session.zig");
-const Session = session_mod.Session;
 
 const log = std.log.scoped(.terminal);
 
@@ -142,7 +141,7 @@ pub const Error = error{
 pub const Terminal = struct {
     io: Io,
     gpa: Allocator,
-    session: *Session,
+    link: session_mod.Link,
     queue_buf: [1024]Msg = undefined,
     queue: Io.Queue(Msg) = undefined,
     mutex: Io.Mutex = .init,
@@ -155,8 +154,8 @@ pub const Terminal = struct {
     next_id: u32 = 1,
     rpc_id: u64 = 10,
 
-    pub fn init(t: *Terminal, io: Io, gpa: Allocator, s: *Session) void {
-        t.* = .{ .io = io, .gpa = gpa, .session = s };
+    pub fn init(t: *Terminal, io: Io, gpa: Allocator, link: session_mod.Link) void {
+        t.* = .{ .io = io, .gpa = gpa, .link = link };
         t.queue = .init(&t.queue_buf);
     }
 
@@ -229,7 +228,7 @@ pub const Terminal = struct {
     }
 
     fn send(t: *Terminal, channel: usize, data: []const u8) Error!void {
-        t.session.send(channel, data) catch |err| switch (err) {
+        t.link.send(channel, data) catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => return error.SessionEnded,
         };

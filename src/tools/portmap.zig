@@ -85,6 +85,12 @@ pub const Endpoint = union(enum) {
     }
 };
 
+/// Serves a shared-session client whose request line is `LEASE` (spec §7.3); owns `conn`.
+pub const RequestHook = struct {
+    ptr: *anyopaque,
+    serveFn: *const fn (ptr: *anyopaque, conn: net.Stream) Io.Cancelable!void,
+};
+
 /// Longest `HOST PORT` request line of a shared-session client, newline included.
 pub const max_mux_request = 300;
 const mux_request_timeout: Io.Duration = .fromSeconds(10);
@@ -142,6 +148,8 @@ pub const PortMap = struct {
     accept_group: Io.Group = .init,
     /// `proxy` outcome: the error that ended its stream, if any.
     last_error: ?anyerror = null,
+    /// Shared session: takes `LEASE` requests.
+    lease_hook: ?RequestHook = null,
 
     pub fn init(io: Io, gpa: Allocator, rules: []const Rule) !PortMap {
         const states = try gpa.alloc(RuleState, rules.len);
@@ -260,6 +268,7 @@ pub const PortMap = struct {
             conn.close(io);
             return;
         };
+        if (std.mem.eql(u8, line, "LEASE")) if (pm.lease_hook) |h| return h.serveFn(h.ptr, conn);
         const req = parseMuxRequest(line) catch {
             muxReply(io, conn, "ERR request\n");
             conn.close(io);

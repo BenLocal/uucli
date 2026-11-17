@@ -86,7 +86,7 @@ is a share id, joined by code.
 | `uucli fav rm\|remove NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
 | `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect] [--no-mux]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
 | `uucli proxy [--no-mux] DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. By default the stream goes through the shared session of DEVICE (§7.2); `--no-mux` opens a session of its own. Exits when the stream ends. |
-| `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). |
+| `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). `terminal`, `exec` and `files` run on a lease of the shared session (§7.3); `--no-mux` opens a session of their own. |
 | `uucli terminal DEVICE --list [--json]` | M3 | Lists remote terminal sessions. |
 | `uucli terminal DEVICE --kill SESSION` | M3 | Ends a remote terminal session. |
 | `uucli exec DEVICE [--timeout SECONDS] [--json] [--] COMMAND...` | M3 | Runs one command in a new remote terminal and prints its output (§11.1.1). Exits with the remote exit code. |
@@ -612,10 +612,33 @@ process (internal command; not a stable interface).
 - An assistance code comes from `UUCLI_ASSIST_CODE` (inherited) or the config; the server never
   prompts.
 - Off with `--no-mux` or `UUCLI_MUX=0` (also `false`, `no`, `off`), and when the socket path would
-  exceed 103 bytes; then `proxy` and `portmap` behave as before (§7, §7.1). `terminal`, `exec` and
-  `files` still open sessions of their own and compete with the shared one. Tried on the official
-  Windows host (2026-11-17): a capture type 9 session also serves terminal open/list, `exec` and
-  `files ls`, so they could share it too; not implemented yet.
+  exceed 103 bytes; then `proxy` and `portmap` behave as before (§7, §7.1), and `terminal`, `exec`
+  and `files` open a session of their own (capture type 8 / 5), which ends the shared one.
+
+### 7.3 Leases for `terminal`, `exec` and `files`
+
+The shared session (capture type 9) also serves the terminal and file protocols: on the official
+Windows host (2026-11-17) a capture type 9 session answered check_env, terminal open / list, `exec`
+and `files ls` / `get`, and a second terminal opened on it after the first one was closed. Their
+request ids (envelope ids, TERM sessions, file rpc ids and task ids) are chosen by each client, so
+clients take turns instead of being multiplexed:
+
+- The client sends `LEASE\n` instead of `HOST PORT`. Leases are granted one at a time, in the order
+  the server takes them; a client waits (without a timeout of its own) while another holds the
+  lease. Port streams keep running meanwhile.
+- Grant: `OK PLATFORM\n` (the host's platform number, §5.4; from the device list, else the join's
+  `publisher_platform`, else 0), then frames both ways: `CHANNEL (u8) LEN (u32 le) DATA`,
+  CHANNEL a data channel index (§6.5), LEN ≤ 2 MiB. Client frames are sent on that channel as they
+  are. The holder receives every inbound message the session would route to a tool (§6.6) except
+  port forwarding (kind 27 on FILE), on the channel it was routed to.
+- The server queues up to 256 messages for the holder; a holder that falls behind loses the lease
+  (connection closed). The lease ends when either side closes the connection; the client then
+  sees the session as ended (exit 5 unless its result is already in).
+- Codes and saving work as without a lease (§5.5), except that a rejected code is not asked for
+  again: the server's error is relayed. A server that answers `LEASE` with `ERR …` predates leases;
+  the client then opens a session of its own.
+- SIGINT / SIGTERM reach the tool as before (Ctrl-C to the remote command, cancel the transfer,
+  detach); the lease is returned when the client exits.
 
 ## 8. Concurrency model
 
@@ -784,6 +807,8 @@ fails the terminal).
   SIGTERM also send Ctrl-C and end the run.
 - Exit code: the remote CODE if 0..255 (so 1..6 can come from either side; stderr says which), else
   1. With `--json` stdout is `{"exit_code":N,"output":"..."}`.
+- Afterwards `exit\r` is typed and CLOSE sent: on a shared session CLOSE only detaches, and the
+  PowerShell line does not exit by itself.
 - Limits: a COMMAND that itself runs `exit` ends the shell before the end marker (output may be
   lost); a PowerShell parse error shows part of the wrapper line.
 
@@ -895,6 +920,7 @@ Real-device log:
 | 2026-11-16 | `fav edit` rename and rename back; `fav edit --save-code` on a copy of the config | passed: both lists showed each new remark; the code was saved with mode 0600 |
 | 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
 | 2026-11-17 | Shared `proxy` session (§7.2), Linux hosts behind a remote-assistance host | passed: 3 concurrent `proxy` and 7 concurrent ssh logins (ah, ProxyCommand) to 7 machines behind one host through one `__mux` process; before, a second concurrent session ended the first (`released`) or failed (`RoomClosed`). Unknown DEVICE relayed as exit 4; idle exit after 60 s removed the socket; `--no-mux` and `UUCLI_MUX=0` connect directly |
+| 2026-11-17 | Leases on the shared session (§7.3), official Windows host | passed while an ssh `proxy` stream stayed up on the same session: `exec` (≈5.7 s with a new server, then about 1 s), two `exec` at once (served one after the other), `files ls` (0.5 s) and `files get` (92-byte file), `terminal --list`, an interactive `terminal` with `~.` (exit 0). The host lists one terminal session and reuses its id for every open |
 
 ## 13. Open questions and protocol drift
 

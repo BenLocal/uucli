@@ -107,6 +107,18 @@ pub const Bus = struct {
     }
 };
 
+/// Where a tool sends its messages: a session of its own (`Session.link`), or a lease on the
+/// shared session (spec §7.3).
+pub const Link = struct {
+    ptr: *anyopaque,
+    sendFn: *const fn (ptr: *anyopaque, channel: usize, data: []const u8) anyerror!void,
+
+    /// Sends one message on data channel `channel`; may block on back-pressure.
+    pub fn send(l: Link, channel: usize, data: []const u8) anyerror!void {
+        return l.sendFn(l.ptr, channel, data);
+    }
+};
+
 pub const Tool = struct {
     ptr: *anyopaque,
     /// Called on the session task for each routed message; must not block. `channel` is
@@ -306,6 +318,15 @@ pub const Session = struct {
     }
 
     /// Sends on a data channel with back-pressure (spec §6.6). Thread-safe.
+    pub fn link(s: *Session) Link {
+        return .{ .ptr = s, .sendFn = sendErased };
+    }
+
+    fn sendErased(ptr: *anyopaque, channel: usize, data: []const u8) anyerror!void {
+        const s: *Session = @ptrCast(@alignCast(ptr));
+        return s.send(channel, data);
+    }
+
     pub fn send(s: *Session, channel: usize, data: []const u8) !void {
         const dc = s.dcs[channel];
         if (dc < 0) return error.SessionClosed;

@@ -15,6 +15,7 @@ const terminal = @import("tools/terminal.zig");
 const files = @import("tools/files.zig");
 const tty = @import("tty.zig");
 const mux = @import("mux.zig");
+const lease = @import("lease.zig");
 
 const log = std.log.scoped(.uucli);
 
@@ -56,7 +57,8 @@ const usage_text =
     \\  fav rm|remove NAME|ID                   Remove a favorite and its saved code
     \\  portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect] [--no-mux]
     \\  proxy [--no-mux] DEVICE HOST PORT       Connect stdin/stdout to HOST:PORT (ssh ProxyCommand);
-    \\                                          proxy and portmap share one background connection per DEVICE
+    \\                                          all commands share one background connection per DEVICE
+    \\                                          (--no-mux on proxy, portmap, terminal, exec, files: own one)
     \\  terminal DEVICE [SESSION] [-e CHAR|none] | --list [--json] | --kill SESSION
     \\  files DEVICE ls REMOTE_DIR [--json] | get REMOTE LOCAL [--force] | put LOCAL REMOTE [--force]
     \\  exec DEVICE [--timeout SECONDS] [--json] [--] COMMAND...
@@ -1048,6 +1050,13 @@ fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
     defer s.close();
     pm.attach(s);
     defer pm.detach();
+    const platform: i64 = if (target.device) |d| switch (d.platform) {
+        .windows => 1,
+        .mac => 4,
+        .unknown => |n| n,
+    } else s.publisher_platform orelse 0;
+    var leases: lease.Server = .{ .io = io, .gpa = app.gpa, .link = s.link(), .platform = platform, .pm = &pm };
+    pm.lease_hook = leases.hook();
 
     const cwd = Io.Dir.cwd();
     cwd.deleteFile(io, sock) catch |err| switch (err) {
@@ -1061,13 +1070,13 @@ fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
     defer pm.stopAccepting();
     // First, so that no new client reaches a server that is going away.
     defer cwd.deleteFile(io, sock) catch {};
-    var idle_task = try io.concurrent(muxIdleWatch, .{ io, &pm, &bus, idle });
+    var idle_task = try io.concurrent(muxIdleWatch, .{ io, &pm, &leases, &bus, idle });
     defer idle_task.cancel(io) catch {};
 
     app.out.writeAll("ready\n") catch {};
     app.out.flush() catch {};
     log.info("shared session ready on {s}", .{sock});
-    const end = s.run(pm.tool()) catch .interrupted;
+    const end = s.run(leases.tool()) catch .interrupted;
     return switch (end) {
         .stopped => .ok,
         .interrupted => interruptedExit(),
@@ -1076,12 +1085,12 @@ fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
 }
 
 /// Stops the session once no stream was open for `idle`.
-fn muxIdleWatch(io: Io, pm: *portmap.PortMap, bus: *session.Bus, idle: Io.Duration) Io.Cancelable!void {
+fn muxIdleWatch(io: Io, pm: *portmap.PortMap, leases: *lease.Server, bus: *session.Bus, idle: Io.Duration) Io.Cancelable!void {
     var since = Io.Clock.awake.now(io);
     while (true) {
         try io.sleep(.fromSeconds(1), .awake);
         const now = Io.Clock.awake.now(io);
-        if (pm.rules[0].streams.load(.monotonic) != 0) {
+        if (pm.rules[0].streams.load(.monotonic) != 0 or leases.clients.load(.monotonic) != 0) {
             since = now;
         } else if (now.compare(.gt, since.addDuration(idle))) {
             log.info("no streams for {d} s, closing the shared session", .{@divTrunc(idle.nanoseconds, std.time.ns_per_s)});
@@ -1093,7 +1102,12 @@ fn muxIdleWatch(io: Io, pm: *portmap.PortMap, bus: *session.Bus, idle: Io.Durati
 
 /// DEVICE as given: a device id or name (account devices, then favorites), or with `--assist` a
 /// remote-assistance share id.
-const DeviceArg = struct { query: []const u8, assist: bool = false };
+const DeviceArg = struct {
+    query: []const u8,
+    assist: bool = false,
+    /// `--no-mux`: open a session of its own instead of using the shared one (spec §7.2, §7.3).
+    own_session: bool = false,
+};
 
 /// Where a session goes: an account device, or a remote-assistance host (share id and code).
 const Target = struct {
@@ -1339,6 +1353,136 @@ fn retryAssistCode(err: session.OpenError, failure: api.Failure, assist: bool, i
         assist and interactive and retries < 3;
 }
 
+/// Runs `worker` on a lease of DEVICE's shared session (spec §7.3), starting the server when
+/// needed. Null: no shared session possible here (socket path too long).
+fn runLeased(
+    app: *App,
+    dev: DeviceArg,
+    target: Target,
+    save_code: bool,
+    comptime Tool: type,
+    tool_state: *Tool,
+    comptime worker: fn (*App, *Tool) Exit,
+) !?Exit {
+    const io = app.io;
+    const cfg_path = try app.configPath();
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch {
+        log.info("config path too long for a shared session; connecting directly", .{});
+        return null;
+    };
+    var granted: ?MuxLease = null;
+    for (0..3) |_| {
+        switch (try muxLease(io, sock)) {
+            .granted => |g| {
+                granted = g;
+                break;
+            },
+            // A server of an older uucli (before leases) is still running: use an own session.
+            .unsupported => {
+                log.info("the running shared session does not take leases; connecting directly", .{});
+                return null;
+            },
+            .gone => if (try startMuxServer(app, cfg_path, dev, sock, target.assist_code)) |code| return code,
+        }
+    }
+    const g = granted orelse return app.fail(.connect, "the shared session did not take the request", .{});
+    var client: lease.Client = .{ .io = io, .gpa = app.gpa, .conn = g.conn };
+    defer g.conn.close(io);
+    if (save_code) {
+        try updateSavedCode(app, target.id, target.assist_code);
+        try app.err.writeAll("The remote code is saved in the config file\n");
+        try app.err.flush();
+    }
+    // An assistance host is not in the device list; the server knows its platform from the join.
+    if (@hasDecl(Tool, "device") and target.device == null)
+        tool_state.device(.{ .id = target.id, .name = target.id, .platform = .from(g.platform), .online = true, .shared = true });
+    tool_state.bind(io, app.gpa, client.link());
+    defer tool_state.unbind();
+
+    var bus_buf: [16]session.Event = undefined;
+    var bus: session.Bus = undefined;
+    try bus.init(io, &bus_buf);
+    defer bus.deinit();
+    try interrupts.install(&bus);
+
+    const Ctx = struct {
+        fn run(a: *App, t: *Tool, b: *session.Bus) Exit {
+            const code = worker(a, t);
+            b.put(.stop);
+            return code;
+        }
+        fn ended(ptr: *anyopaque) void {
+            const t: *Tool = @ptrCast(@alignCast(ptr));
+            t.sessionEnded();
+        }
+    };
+    var reader = try io.concurrent(lease.Client.readTask, .{ &client, tool_state.tool(), Ctx.ended, @as(*anyopaque, tool_state) });
+    defer {
+        // Unblock the reader, then wait for it.
+        g.conn.shutdown(io, .both) catch {};
+        reader.cancel(io) catch {};
+    }
+    var task = try io.concurrent(Ctx.run, .{ app, tool_state, &bus });
+    var interrupted = false;
+    while (true) {
+        const e = bus.next() catch break;
+        defer e.deinit();
+        switch (e) {
+            .interrupt => if (!interrupted) {
+                interrupted = true;
+                // Optional hooks must be `pub`: @hasDecl does not see private declarations.
+                if (@hasDecl(Tool, "interrupted")) tool_state.interrupted() else tool_state.sessionEnded();
+            },
+            .stop => break,
+            else => {},
+        }
+    }
+    const code = task.await(io);
+    if (@hasDecl(Tool, "completed") and tool_state.completed()) return code;
+    if (interrupted) return interruptedExit();
+    if (client.lost.load(.acquire) and code == .ok) return app.fail(.connect, "the shared session ended", .{});
+    return code;
+}
+
+const MuxLease = struct { conn: Io.net.Stream, platform: i64 };
+
+/// Asks the shared session at `sock` for a lease; waits while another client holds it. `gone`: no
+/// server, or it closed before answering.
+fn muxLease(io: Io, sock: []const u8) !union(enum) { granted: MuxLease, gone, unsupported } {
+    const conn = (try Io.net.UnixAddress.init(sock)).connect(io) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => return .gone,
+        else => |e| return e,
+    };
+    var keep = false;
+    defer if (!keep) conn.close(io);
+    {
+        var wb: [16]u8 = undefined;
+        var w = conn.writer(io, &wb);
+        w.interface.writeAll("LEASE\n") catch return .gone;
+        w.interface.flush() catch return .gone;
+    }
+    var line: [32]u8 = undefined;
+    var n: usize = 0;
+    {
+        // Unbuffered: frames follow the reply line.
+        var one: [1]u8 = undefined;
+        var r = conn.reader(io, &one);
+        while (true) {
+            const b = r.interface.takeByte() catch return .gone;
+            if (b == '\n') break;
+            if (n == line.len) return error.InvalidReply;
+            line[n] = b;
+            n += 1;
+        }
+    }
+    if (std.mem.startsWith(u8, line[0..n], "ERR ")) return .unsupported;
+    if (!std.mem.startsWith(u8, line[0..n], "OK ")) return error.InvalidReply;
+    const platform = std.fmt.parseInt(i64, line[3..n], 10) catch return error.InvalidReply;
+    keep = true;
+    return .{ .granted = .{ .conn = conn, .platform = platform } };
+}
+
 /// One session for a tool that runs `worker` (on its own task) while this task routes messages.
 fn runToolSession(
     app: *App,
@@ -1366,6 +1510,8 @@ fn runToolSession(
     var save_code = remember_codes and interactive and target.assist_code != null and
         cfg.assistCode(target.id) == null and
         (if (app.env.get("UUCLI_ASSIST_CODE")) |code| code.len == 0 else true);
+    if (!dev.own_session and muxEnabled(app))
+        if (try runLeased(app, dev, target, save_code, Tool, tool_state, worker)) |code| return code;
     var code_retries: u8 = 0;
     const s = while (true) {
         const opened = session.Session.open(.{
@@ -1399,7 +1545,7 @@ fn runToolSession(
     // An assistance host is not in the device list; its platform comes from the room join.
     if (@hasDecl(Tool, "device") and target.device == null) if (s.publisher_platform) |p|
         tool_state.device(.{ .id = target.id, .name = target.id, .platform = .from(p), .online = true, .shared = true });
-    tool_state.bind(app.io, app.gpa, s);
+    tool_state.bind(app.io, app.gpa, s.link());
     defer tool_state.unbind();
 
     const Ctx = struct {
@@ -1435,8 +1581,8 @@ const TerminalCmd = struct {
     mode: union(enum) { attach: u32, list: bool, kill: u32 },
     escape: ?u8,
 
-    fn bind(c: *TerminalCmd, io: Io, gpa: Allocator, s: *session.Session) void {
-        c.t.init(io, gpa, s);
+    fn bind(c: *TerminalCmd, io: Io, gpa: Allocator, link: session.Link) void {
+        c.t.init(io, gpa, link);
     }
     fn unbind(c: *TerminalCmd) void {
         c.t.deinit();
@@ -1461,11 +1607,14 @@ fn cmdTerminal(app: *App, args: []const [:0]const u8) !Exit {
     var json = false;
     var kill: ?u32 = null;
     var assist = false;
+    var own_session = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (isFlag(a, "--list", "-l")) {
             list = true;
+        } else if (eql(a, "--no-mux")) {
+            own_session = true;
         } else if (eql(a, "--assist")) {
             assist = true;
         } else if (isFlag(a, "--json", "-j")) {
@@ -1494,7 +1643,7 @@ fn cmdTerminal(app: *App, args: []const [:0]const u8) !Exit {
         .mode = if (list) .{ .list = json } else if (kill) |k| .{ .kill = k } else .{ .attach = session_id orelse 0 },
         .escape = escape,
     };
-    return runToolSession(app, .{ .query = query, .assist = assist }, 8, TerminalCmd, &cmd, terminalWorker);
+    return runToolSession(app, .{ .query = query, .assist = assist, .own_session = own_session }, 8, TerminalCmd, &cmd, terminalWorker);
 }
 
 fn terminalError(app: *App, err: terminal.Error) Exit {
@@ -1531,8 +1680,8 @@ const ExecCmd = struct {
         // The official Windows host runs PowerShell; other hosts run a POSIX shell.
         c.shell = if (d.platform == .windows) .powershell else .posix;
     }
-    fn bind(c: *ExecCmd, io: Io, gpa: Allocator, s: *session.Session) void {
-        c.t.init(io, gpa, s);
+    fn bind(c: *ExecCmd, io: Io, gpa: Allocator, link: session.Link) void {
+        c.t.init(io, gpa, link);
     }
     fn unbind(c: *ExecCmd) void {
         c.t.deinit();
@@ -1554,6 +1703,7 @@ fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
     var timeout_s: u32 = 300;
     var json = false;
     var assist = false;
+    var own_session = false;
     var i: usize = 0;
     // Options come before COMMAND; the first other word after DEVICE (or `--`) starts it, so the
     // command can have options of its own.
@@ -1566,6 +1716,8 @@ fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
             json = true;
         } else if (eql(a, "--assist")) {
             assist = true;
+        } else if (eql(a, "--no-mux")) {
+            own_session = true;
         } else if (isFlag(a, "--timeout", "-t")) {
             i += 1;
             if (i == args.len) return usage(app, "{s} needs a number of seconds", .{a});
@@ -1589,7 +1741,7 @@ fn cmdExec(app: *App, args: []const [:0]const u8) !Exit {
         .timeout = if (timeout_s == 0) null else .fromSeconds(timeout_s),
         .json = json,
     };
-    return runToolSession(app, .{ .query = query, .assist = assist }, 8, ExecCmd, &cmd, execWorker);
+    return runToolSession(app, .{ .query = query, .assist = assist, .own_session = own_session }, 8, ExecCmd, &cmd, execWorker);
 }
 
 fn execWorker(app: *App, cmd: *ExecCmd) Exit {
@@ -1603,7 +1755,12 @@ fn execWorker(app: *App, cmd: *ExecCmd) Exit {
     };
     // Wide, so the shell rarely wraps output lines.
     const id = t.open(app.arena, 0, 200, 50) catch |err| return terminalError(app, err);
-    defer t.close(id);
+    defer {
+        // The PowerShell line does not exit (spec §11.1.1), and on a shared session CLOSE only
+        // detaches: end the shell, or every exec would leave one running on the host.
+        t.write(id, "exit\r") catch {};
+        t.close(id);
+    }
     var nonce_raw: [8]u8 = undefined;
     app.io.random(&nonce_raw);
     const nonce = std.fmt.bytesToHex(nonce_raw, .lower);
@@ -1728,8 +1885,8 @@ const FilesCmd = struct {
         put: struct { local: []const u8, remote: []const u8, force: bool },
     },
 
-    fn bind(c: *FilesCmd, io: Io, gpa: Allocator, s: *session.Session) void {
-        c.f.init(io, gpa, s);
+    fn bind(c: *FilesCmd, io: Io, gpa: Allocator, link: session.Link) void {
+        c.f.init(io, gpa, link);
     }
     fn unbind(c: *FilesCmd) void {
         c.f.deinit();
@@ -1751,8 +1908,9 @@ fn cmdFiles(app: *App, args: []const [:0]const u8) !Exit {
     var json = false;
     var force = false;
     var assist = false;
+    var own_session = false;
     for (args) |a| {
-        if (isFlag(a, "--json", "-j")) json = true else if (isFlag(a, "--force", "-f")) force = true else if (eql(a, "--assist")) assist = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
+        if (isFlag(a, "--json", "-j")) json = true else if (isFlag(a, "--force", "-f")) force = true else if (eql(a, "--assist")) assist = true else if (eql(a, "--no-mux")) own_session = true else if (a.len > 1 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else try pos.append(app.arena, a);
     }
     const p = pos.items;
     if (p.len < 2) return usage(app, usage_files, .{});
@@ -1771,7 +1929,7 @@ fn cmdFiles(app: *App, args: []const [:0]const u8) !Exit {
         if (files.splitRemote(p[3]) == null) return usage(app, "invalid remote file name {s}", .{p[3]});
         cmd = .{ .op = .{ .put = .{ .local = p[2], .remote = p[3], .force = force } } };
     } else return usage(app, usage_files, .{});
-    return runToolSession(app, .{ .query = p[0], .assist = assist }, 5, FilesCmd, &cmd, filesWorker);
+    return runToolSession(app, .{ .query = p[0], .assist = assist, .own_session = own_session }, 5, FilesCmd, &cmd, filesWorker);
 }
 
 fn filesError(app: *App, f: *const files.Files, err: files.Error) Exit {
@@ -1876,6 +2034,7 @@ test {
     _ = @import("tools/files.zig");
     _ = @import("tty.zig");
     _ = mux;
+    _ = lease;
     _ = interrupts;
     _ = @import("e2e_test.zig");
     _ = @import("vectors_test.zig");

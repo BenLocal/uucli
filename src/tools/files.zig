@@ -6,7 +6,6 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const wire = @import("../wire.zig");
 const session_mod = @import("../session.zig");
-const Session = session_mod.Session;
 
 const log = std.log.scoped(.files);
 
@@ -138,7 +137,7 @@ var next_id: std.atomic.Value(u64) = .init(100);
 pub const Files = struct {
     io: Io,
     gpa: Allocator,
-    session: *Session,
+    link: session_mod.Link,
     queue_buf: [1024]Msg = undefined,
     queue: Io.Queue(Msg) = undefined,
     overflow: std.atomic.Value(bool) = .init(false),
@@ -149,8 +148,8 @@ pub const Files = struct {
     done: u64 = 0,
     total: u64 = 0,
 
-    pub fn init(f: *Files, io: Io, gpa: Allocator, s: *Session) void {
-        f.* = .{ .io = io, .gpa = gpa, .session = s };
+    pub fn init(f: *Files, io: Io, gpa: Allocator, link: session_mod.Link) void {
+        f.* = .{ .io = io, .gpa = gpa, .link = link };
         f.queue = .init(&f.queue_buf);
     }
 
@@ -213,7 +212,7 @@ pub const Files = struct {
     }
 
     fn sendControl(f: *Files, data: []const u8) Error!void {
-        f.session.send(wire.control, data) catch |err| switch (err) {
+        f.link.send(wire.control, data) catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => return error.SessionEnded,
         };

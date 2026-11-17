@@ -75,12 +75,13 @@ Host office
     ProxyCommand uucli proxy %h 127.0.0.1 22
 ```
 
-A host accepts one connection at a time, so all `proxy` commands and `portmap` connections for one
-device share a single connection, kept by a background `uucli` process that exits 60 s after its
-last stream (`UUCLI_MUX_IDLE=SECONDS` to change) and is started again on demand. Several ssh
-sessions, also to different machines behind the same host, can then run at once. `--no-mux` or
-`UUCLI_MUX=0` uses a connection of its own (as does `portmap --no-reconnect`). `terminal`, `exec`
-and `files` still use their own connections and end a shared one while they run on the same host.
+A host accepts one connection at a time, so every command for one device shares a single
+connection, kept by a background `uucli` process that exits 60 s after its last user
+(`UUCLI_MUX_IDLE=SECONDS` to change) and is started again on demand. `proxy` and `portmap` streams
+run in parallel, also to different machines behind the same host; `terminal`, `exec` and `files`
+take turns (one at a time per device, the others wait) while the streams keep running. `--no-mux`
+or `UUCLI_MUX=0` uses a connection of its own (as does `portmap --no-reconnect`); that ends the
+shared one.
 
 ## Remote terminal
 
