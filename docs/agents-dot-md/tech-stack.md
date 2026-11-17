@@ -34,6 +34,7 @@ zig build -Doptimize=ReleaseSafe # 发布构建
 zig build release                # 4 个平台的 tar.gz，写到 zig-out/release/
 zig build release -Drelease-os=linux  # 只打 Linux 的两个包（CI 在 Linux runner 上这样用）
 zig fmt --check build.zig build.zig.zon src tests  # CI 的 lint 步骤，必须通过
+python3 tests/cli_parity.py /path/to/before zig-out/bin/uucli  # Compare offline CLI behavior during refactors
 ```
 
 - 全仓已按 Zig 0.17.1 的 `zig fmt` 统一格式（2026-11-16，包括 `@intFromEnum` → `@backingInt` 这类改名），CI 的 lint 任务跑 `zig fmt --check`，不通过就失败。提交前对改动的文件跑一次 `zig fmt`。
@@ -64,7 +65,8 @@ zig-out/bin/uucli -v term DEVICE -l   # -v 能看到主机拒绝时返回的状�
 
 以「给某个工具加一个子命令或参数」为例：
 
-1. `src/main.zig` — 在对应的 `cmdXxx` 里解析参数，参照 `cmdTerminal` / `cmdFiles` 的写法；错误走 `usage(...)`（退出码 2）或 `app.fail(...)`。
+1. `src/cmd/<command>.zig` — Parse arguments in `pub fn run(app, args) !Exit`, following `cmd/terminal.zig` / `cmd/files.zig`. Use `app.usage(...)` (exit 2) or `App.fail(...)` for errors. Add new command dispatch and fixed aliases in `src/main.zig`; keep command-specific tests with the command.
+   Shared CLI helpers belong in `app.zig`, target / code handling in `target.zig`, and tool execution in `tool_runner.zig`. Methods on tool state called by the runner must be `pub`. Reference new modules in the root test block so their tests are discovered.
 2. `src/tools/<tool>.zig` — 实现协议交互，请求 / 应答用工具自带的 `request(...)`，参照 `Terminal.list` / `Terminal.open`。
 3. `src/wire.zig` — 只有新的 protobuf 结构才需要改；改了就补 golden vector 或单元测试。
 4. `src/e2e_test.zig` — 用进程内 fake host 补一条端到端测试。

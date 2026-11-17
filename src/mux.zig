@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared connections (spec §7.2–§7.4): socket paths, management requests and idle expiry.
-//! The serving side is `PortMap.startMuxAccepting`; process handling is in main.zig.
+//! The serving side is `PortMap.startMuxAccepting`; startup and serving live in mux_client/server.zig.
 const std = @import("std");
 const Io = std.Io;
 const portmap = @import("tools/portmap.zig");

@@ -7,27 +7,34 @@
 ## 组件与调用方向
 
 ```text
-              主控端（uucli，Linux / macOS）                              被控端（官方 UU 客户端）
- main.zig ──> api.zig ──HTTPS──> UU 云端 API（登录、设备列表、加入房间）
-    │
-    └──> session.zig ──> signal.zig ──> ws.zig ──WSS──> 信令服务（Socket.IO）<──> 被控端
-              │
-              └──> rtc.zig ──libdatachannel（ICE / DTLS / SCTP）──────────────> 被控端
-              ▲        │ 事件队列（Io.Queue）
-              │        ▼
-         tools/portmap.zig · tools/terminal.zig · tools/files.zig
+main.zig -> cmd/*.zig -> app.zig / target.zig
+                     -> tool_runner.zig -> session.zig -> api / signal / rtc
+                     -> mux_client.zig -- Unix socket --> mux_server.zig
+                                                            -> mux / lease / session
 ```
 
-- Each process owns one `std.Io` instance. A background `__mux` process holds the shared connection; port streams run in parallel and terminal / exec / files clients take serial leases. `session start` keeps it open; automatic connections expire when idle (spec §7.2–§7.4).
-- 依赖方向：`main` → `tools/*` → `session` → `api` / `rtc` / `signal` / `wire`；`tools/*` 只依赖 `session` 和 `wire`，彼此互不依赖；`login` → `api` → `config`；`signal` → `ws`。没有反向依赖，`rtc`、`wire`、`ws`、`config` 不依赖任何项目模块。
-
-- Local management follows `main` → `mux` → `lease` / `tools/portmap` / `session`. `mux.Control` owns the keep flag and management requests; transport setup remains in `session`.
+- Each public top-level command owns one `cmd/<command>.zig` module with a `run(app, args)` entry.
+  `main` initializes the process, parses global flags, resolves fixed aliases, dispatches commands,
+  and maps uncaught errors. Commands do not import each other or `main`.
+- `app` owns CLI context, configuration loading, output helpers and exit codes. `target` resolves
+  devices and favorites and handles assistance codes. `tool_runner` runs tools on direct sessions
+  or leases and owns interruption, teardown and direct portmap reconnects.
+- `mux_client` starts the background process and handles local stream / lease connections.
+  `mux_server` implements internal `__mux`; `mux.Control` owns keep / idle state and management.
+  Shared modules never import command modules. Protocol modules remain under `tools/`.
+- Each process owns one `std.Io` instance. Port streams share a background connection in parallel;
+  terminal / exec / files take serial leases. `session start` keeps the connection open; automatic
+  connections expire when idle (spec §7.2–§7.4).
 
 ## 模块边界
 
 | 模块 | 职责 | 不做什么 |
 | --- | --- | --- |
-| `main.zig` | 参数解析、简写、设备解析、退出码映射 | 不碰协议细节 |
+| `main.zig` | Process startup, global flags, fixed aliases and dispatch | No command execution logic |
+| `cmd/*.zig` | Command-specific parsing, execution, output and tests | No protocol encoding |
+| `app.zig` / `target.zig` | Shared CLI context, errors, config handling, device resolution and assistance codes | No command dispatch |
+| `tool_runner.zig` | Direct / leased tool execution, interruption and reconnects | No command-specific parsing |
+| `mux_client.zig` / `mux_server.zig` | Background process startup, Unix socket clients and internal server | No user command parsing |
 | `config.zig` / `login.zig` / `api.zig` | 配置文件（权限、锁）、设备注册与扫码登录、REST 签名与错误码映射 | 不碰 WebRTC |
 | `mux.zig` / `lease.zig` | Local socket identity, connection management, keep / idle state, and serial tool leases | No remote business protocol encoding |
 | `session.zig` | 加入房间 → 信令 → WebRTC → echo → ready；把消息路由给工具 | 不理解工具的业务帧 |
@@ -37,7 +44,7 @@
 
 ## 关键链路：`uucli term DEVICE`
 
-1. `main.zig` 用 `device list` 把名字或 ID 解析成设备（spec §3.3）。
+1. `main` dispatches to `cmd/terminal.run`; `tool_runner` uses `target.resolveTarget` to resolve the name or ID (spec §3.3), then selects a shared lease or direct session.
 2. `api.zig` 调 `room/join/by_device/{id}`；被控端正被别的主控端控制时返回 API `2002`，直接以退出码 6 结束（spec §6.1）。
 3. `session.zig` 走 Socket.IO 信令发 offer、收 answer，`rtc.zig` 建立 ICE / DTLS 和 5 个数据通道，双方 echo 后进入 ready（spec §6）。
 4. `tools/terminal.zig` 先发环境检查（官方 Windows 主机不回应，3 秒后视为不支持），再在 BINARY 通道发 `TERM` 帧 OPEN；成功后在 raw 模式下双向转发（spec §11.1）。
@@ -53,5 +60,5 @@
 
 ## 扩展点
 
-- 新工具 / 子命令：照 `tools/terminal.zig` 的结构写，`main.zig` 里用 `runToolSession(app, DEVICE, capture_type, …)` 接入；capture type 见 spec §6.3。
+- New commands live in `cmd/<name>.zig` and are dispatched from `main.run`. Follow `cmd/terminal.zig` / `cmd/files.zig` and call `tool_runner.runToolSession` for remote tools; capture types are defined in spec §6.3. Keep remote protocol implementation in `tools/`.
 - 新的协议字段：先在 spec 里写明来源（上游文件或真机报文），再改 `wire.zig` 并补测试。

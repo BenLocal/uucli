@@ -734,7 +734,24 @@ uucli/
 ├── docs/spec.md
 ├── tests/vectors/         # golden data generated from upstream (§10)
 └── src/
-    ├── main.zig           # argument parsing, dispatch, exit codes
+    ├── main.zig           # process initialization, global flags, aliases and dispatch
+    ├── app.zig            # shared CLI context, config handling, exit codes and output helpers
+    ├── target.zig         # device / favorite resolution and assistance codes
+    ├── tool_runner.zig    # direct / leased tool execution, interrupts and portmap reconnects
+    ├── mux_client.zig     # shared connection startup, stream relay and lease handshake
+    ├── mux_server.zig     # internal __mux command and idle watcher
+    ├── cmd/               # one module per public top-level command
+    │   ├── login.zig
+    │   ├── logout.zig
+    │   ├── device.zig
+    │   ├── fav.zig
+    │   ├── portmap.zig
+    │   ├── proxy.zig
+    │   ├── session.zig
+    │   ├── terminal.zig
+    │   ├── exec.zig
+    │   ├── files.zig
+    │   └── debug.zig
     ├── config.zig         # path, permissions, atomic write, flock
     ├── api.zig            # REST client, signing, error mapping
     ├── login.zig          # device registration, QR flow
@@ -753,6 +770,15 @@ uucli/
         ├── terminal.zig
         └── files.zig
 ```
+
+Public commands expose `run(app: *App, args: []const [:0]const u8) !Exit` from `cmd/<command>.zig`.
+`main.zig` handles global flags and fixed aliases before dispatch, and maps uncaught errors through
+`app.errorExit`. Commands use `app`, `target`, `tool_runner` and `mux_client`; shared modules never
+import `main` or command modules. The existing `tools/` modules still implement remote protocols.
+Tool state methods called across files (`bind`, `unbind`, `tool`, `sessionEnded`, plus optional
+hooks) must be public. The root test block explicitly references command and shared modules so
+Zig's lazy analysis does not omit their tests. Command tests live beside each command; the
+existing RTC fake-host and vector suites remain in their original modules.
 
 | uucli module | Upstream (v0.2.59) |
 | --- | --- |
@@ -988,6 +1014,7 @@ Real-device log:
 | 2026-11-17 | Shared `proxy` session (§7.2), Linux hosts behind a remote-assistance host | passed: 3 concurrent `proxy` and 7 concurrent ssh logins (ah, ProxyCommand) to 7 machines behind one host through one `__mux` process; before, a second concurrent session ended the first (`released`) or failed (`RoomClosed`). Unknown DEVICE relayed as exit 4; idle exit after 60 s removed the socket; `--no-mux` and `UUCLI_MUX=0` connect directly |
 | 2026-11-17 | Leases on the shared session (§7.3), official Windows host | passed while an ssh `proxy` stream stayed up on the same session: `exec` (≈5.7 s with a new server, then about 1 s), two `exec` at once (served one after the other), `files ls` (0.5 s) and `files get` (92-byte file), `terminal --list`, an interactive `terminal` with `~.` (exit 0). The host lists one terminal session and reuses its id for every open |
 | 2026-11-17 | Local session management (§7.4) | Offline tests passed with Unix sockets and the in-process RTC host: repeated keep, idle expiry, management during active / waiting leases, busy stop refusal and forced teardown. CLI tests cover config isolation, names / IDs, stale sockets, JSON, and idempotent start / stop. Real-host validation is pending: device discovery and system curl both failed to resolve the API hostname. |
+| 2026-11-17 | Command module refactor (§9) | Debug build and 84 offline tests passed (the hook checks now run separately for terminal, exec and files). The pre-refactor and refactored binaries matched exit codes, stdout and stderr across 96 offline CLI cases via `tests/cli_parity.py`. Real-host discovery remains blocked by API DNS resolution (`UnknownHostName`). |
 
 ## 13. Open questions and protocol drift
 
