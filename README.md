@@ -75,6 +75,13 @@ Host office
     ProxyCommand uucli proxy %h 127.0.0.1 22
 ```
 
+A host accepts one connection at a time, so all `proxy` commands for one device share a single
+connection, kept by a background `uucli` process that exits 60 s after its last stream
+(`UUCLI_MUX_IDLE=SECONDS` to change). Several ssh sessions, also to different machines behind the
+same host, can then run at once. `proxy --no-mux` or `UUCLI_MUX=0` uses a connection of its own.
+`terminal`, `exec`, `files` and `portmap` still use their own connections and end a shared one
+while they run on the same host.
+
 ## Remote terminal
 
 ```sh

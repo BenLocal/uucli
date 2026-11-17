@@ -85,7 +85,7 @@ is a share id, joined by code.
 | `uucli fav edit NAME\|ID [NEW_NAME] [--save-code]` | — | Changes a favorite (resolved like §3.3 step 4; exit 4 when absent): `NEW_NAME` re-adds it with that remark and its original `favorited_at`; `--save-code` replaces the code in the config. At least one of the two, else exit 2. |
 | `uucli fav rm\|remove NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
 | `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
-| `uucli proxy DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. Exits when either side closes. |
+| `uucli proxy [--no-mux] DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. By default the stream goes through the shared session of DEVICE (§7.2); `--no-mux` opens a session of its own. Exits when the stream ends. |
 | `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). |
 | `uucli terminal DEVICE --list [--json]` | M3 | Lists remote terminal sessions. |
 | `uucli terminal DEVICE --kill SESSION` | M3 | Ends a remote terminal session. |
@@ -576,6 +576,39 @@ Default on for `portmap`, off for `proxy`.
   same code, which fails once the host withdraws the share.
 - `--no-reconnect`: exit with code 5 when the session ends.
 
+### 7.2 Shared `proxy` session
+
+A host keeps one controller session at a time: a second session to it ends the first one
+(`leave` → `released`), and two joining at once can end the later one (`RoomClosed`). So every
+`proxy` of one DEVICE shares one session, held by a background `uucli __mux [--assist] DEVICE`
+process (internal command; not a stable interface).
+
+- Files in `CONFIG_DIR/mux/` (mode 0700), named `HASH.sock`, `HASH.lock`, `HASH.log` (0600). HASH
+  is a 64-bit Wyhash of the config path, `--assist`, and DEVICE as written, so different accounts
+  and spellings of DEVICE get separate sessions.
+- `proxy` connects to `HASH.sock`. If that fails it takes an exclusive `flock` on `HASH.lock`,
+  tries again (another `proxy` may have started a server meanwhile), removes a stale socket file,
+  and starts `__mux` with its own process group (an ssh client killing the ProxyCommand's group
+  does not end it), stdin `/dev/null`, stdout a pipe, stderr `HASH.log` (truncated), passing `-v` /
+  `-vv`. The server prints `ready` on stdout once it listens; if stdout ends without it, `proxy`
+  copies `HASH.log` to stderr and exits with the server's exit code (for example 4 for an unknown
+  DEVICE). A server that goes away before answering is replaced, at most 3 attempts.
+- Wire: the client sends `HOST PORT
+` (HOST 1..255 bytes without spaces or control characters,
+  PORT 1..65535) and waits for one line: `OK` after the SYN-ACK, then the stream's bytes both ways;
+  `ERR rejected` (exit 6), `ERR timeout` (exit 5), `ERR request` / `ERR failed` (exit 5). The
+  request must arrive within 10 s. End of stdin half-closes the socket; `proxy` exits 0 when the
+  socket ends.
+- The server opens the session like `portmap` (capture type 9) but does not reconnect: when the
+  session ends it removes the socket file and exits, closing its streams; the next `proxy` starts
+  a new one. It also ends after `UUCLI_MUX_IDLE` seconds (default 60) without streams, and on
+  SIGINT / SIGTERM. The socket file is removed before the listener closes.
+- An assistance code comes from `UUCLI_ASSIST_CODE` (inherited) or the config; the server never
+  prompts.
+- Off with `--no-mux` or `UUCLI_MUX=0` (also `false`, `no`, `off`), and when the socket path would
+  exceed 103 bytes; then `proxy` behaves as before. `terminal`, `exec`, `files` and `portmap`
+  still open sessions of their own and compete with the shared one.
+
 ## 8. Concurrency model
 
 - One process, one `std.Io` instance: `std.Io.Threaded`, the one `std.process.Init` provides.
@@ -853,6 +886,7 @@ Real-device log:
 | 2026-11-16 | `login` method prompt, `login --phone` input checks, send-code request for `00000` (on a copy of the config) | prompt and checks as specified; the send-code request was accepted (code 0) without validating the number. Receiving an SMS and `by_mobile` with a real number not tested yet |
 | 2026-11-16 | `fav edit` rename and rename back; `fav edit --save-code` on a copy of the config | passed: both lists showed each new remark; the code was saved with mode 0600 |
 | 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
+| 2026-11-17 | Shared `proxy` session (§7.2), Linux hosts behind a remote-assistance host | passed: 3 concurrent `proxy` and 7 concurrent ssh logins (ah, ProxyCommand) to 7 machines behind one host through one `__mux` process; before, a second concurrent session ended the first (`released`) or failed (`RoomClosed`). Unknown DEVICE relayed as exit 4; idle exit after 60 s removed the socket; `--no-mux` and `UUCLI_MUX=0` connect directly |
 
 ## 13. Open questions and protocol drift
 

@@ -14,6 +14,7 @@ const portmap = @import("tools/portmap.zig");
 const terminal = @import("tools/terminal.zig");
 const files = @import("tools/files.zig");
 const tty = @import("tty.zig");
+const mux = @import("mux.zig");
 
 const log = std.log.scoped(.uucli);
 
@@ -54,7 +55,8 @@ const usage_text =
     \\                                          Rename a favorite and/or replace its saved code
     \\  fav rm|remove NAME|ID                   Remove a favorite and its saved code
     \\  portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]
-    \\  proxy DEVICE HOST PORT                  Connect stdin/stdout to HOST:PORT (ssh ProxyCommand)
+    \\  proxy [--no-mux] DEVICE HOST PORT       Connect stdin/stdout to HOST:PORT (ssh ProxyCommand);
+    \\                                          proxies of one DEVICE share one background connection
     \\  terminal DEVICE [SESSION] [-e CHAR|none] | --list [--json] | --kill SESSION
     \\  files DEVICE ls REMOTE_DIR [--json] | get REMOTE LOCAL [--force] | put LOCAL REMOTE [--force]
     \\  exec DEVICE [--timeout SECONDS] [--json] [--] COMMAND...
@@ -76,7 +78,8 @@ const usage_text =
     \\  -h, --help   Print this help
     \\
     \\Environment: UUCLI_CONFIG (config file), UUCLI_USE_PROXY=1 (honor HTTP(S)_PROXY),
-    \\  UUCLI_ASSIST_CODE (remote-assistance code)
+    \\  UUCLI_ASSIST_CODE (remote-assistance code), UUCLI_MUX=0 (proxy without a shared connection),
+    \\  UUCLI_MUX_IDLE (seconds a shared connection stays open without streams, default 60)
     \\
 ;
 
@@ -213,6 +216,8 @@ fn run(app: *App, all_args: []const [:0]const u8) Exit {
         cmdExec(app, rest)
     else if (eql(cmd, "debug"))
         cmdDebug(app, rest)
+    else if (eql(cmd, "__mux"))
+        cmdMuxServe(app, rest)
     else
         return usage(app, "unknown command {s}", .{cmd});
     return result catch |err| errorExit(app, err);
@@ -634,11 +639,21 @@ fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
 }
 
 fn cmdProxy(app: *App, all_args: []const [:0]const u8) !Exit {
-    const assist = all_args.len != 0 and eql(all_args[0], "--assist");
-    const args = if (assist) all_args[1..] else all_args;
-    if (args.len != 3) return usage(app, "expected `proxy DEVICE HOST PORT` or `proxy --assist ID HOST PORT`", .{});
+    var assist = false;
+    var shared = muxEnabled(app);
+    var args = all_args;
+    while (args.len != 0) : (args = args[1..]) {
+        if (eql(args[0], "--assist")) {
+            assist = true;
+        } else if (eql(args[0], "--no-mux")) {
+            shared = false;
+        } else break;
+    }
+    if (args.len != 3) return usage(app, "expected `proxy [--assist] [--no-mux] DEVICE HOST PORT`", .{});
     const port = std.fmt.parseInt(u16, args[2], 10) catch 0;
-    if (port == 0 or args[1].len == 0) return usage(app, "invalid HOST PORT", .{});
+    if (port == 0 or args[1].len == 0 or args[1].len > 255) return usage(app, "invalid HOST PORT", .{});
+    for (args[1]) |c| if (c <= ' ' or c == 0x7f) return usage(app, "invalid HOST PORT", .{});
+    if (shared) if (try proxyViaMux(app, .{ .query = args[0], .assist = assist }, args[1], port)) |code| return code;
 
     var cfg: config.Config = undefined;
     var client: api.Client = undefined;
@@ -666,6 +681,263 @@ fn cmdProxy(app: *App, all_args: []const [:0]const u8) !Exit {
         .reconnect = false,
         .proxy = true,
     });
+}
+
+// --- shared proxy session (spec §7.2) -----------------------------------------------------------
+
+/// Unix sockets exist, and `UUCLI_MUX` is not 0/false/no/off.
+fn muxEnabled(app: *App) bool {
+    if (!Io.net.has_unix_sockets) return false;
+    const v = app.env.get("UUCLI_MUX") orelse return true;
+    const t = std.mem.trim(u8, v, " ");
+    for ([_][]const u8{ "0", "false", "no", "off" }) |no| if (std.ascii.eqlIgnoreCase(t, no)) return false;
+    return true;
+}
+
+/// `proxy` through the shared session of DEVICE, starting it when needed. Null: not possible here
+/// (socket path too long), connect directly instead.
+fn proxyViaMux(app: *App, dev: DeviceArg, host: []const u8, port: u16) !?Exit {
+    const cfg_path = try app.configPath();
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch {
+        log.info("config path too long for a shared session; connecting directly", .{});
+        return null;
+    };
+    // A server can go away between connect and reply (idle exit, session lost): start a new one.
+    for (0..3) |_| {
+        if (try muxClient(app, sock, host, port)) |code| return code;
+        if (try startMuxServer(app, cfg_path, dev, sock)) |code| return code;
+    }
+    return app.fail(.connect, "the shared session did not take the connection", .{});
+}
+
+/// Sends `HOST PORT`, then copies stdin/stdout to the stream. Null: no server, or it closed
+/// before answering.
+fn muxClient(app: *App, sock: []const u8, host: []const u8, port: u16) !?Exit {
+    const io = app.io;
+    const addr = try Io.net.UnixAddress.init(sock);
+    const conn = addr.connect(io) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => return null,
+        else => |e| return e,
+    };
+    defer conn.close(io);
+    {
+        var wb: [portmap.max_mux_request]u8 = undefined;
+        var w = conn.writer(io, &wb);
+        w.interface.print("{s} {d}\n", .{ host, port }) catch return null;
+        w.interface.flush() catch return null;
+    }
+    var line: [32]u8 = undefined;
+    var n: usize = 0;
+    {
+        // Unbuffered: the stream's bytes follow the reply line.
+        var one: [1]u8 = undefined;
+        var r = conn.reader(io, &one);
+        while (true) {
+            const b = r.interface.takeByte() catch return null;
+            if (b == '\n') break;
+            if (n == line.len) return app.fail(.connect, "invalid reply from the shared session", .{});
+            line[n] = b;
+            n += 1;
+        }
+    }
+    switch (mux.parseReply(line[0..n])) {
+        .ok => {},
+        .rejected => return app.fail(.remote, "the device refused the connection to the target", .{}),
+        .timeout => return app.fail(.connect, "the device did not answer the connection request", .{}),
+        .failed => return app.fail(.connect, "the shared session could not open the stream", .{}),
+    }
+    const U = union(enum) { up: void, down: void };
+    var buf: [2]U = undefined;
+    var sel: Io.Select(U) = .init(io, &buf);
+    defer sel.cancelDiscard();
+    try sel.concurrent(.up, muxUp, .{ io, conn });
+    try sel.concurrent(.down, muxDown, .{ io, conn });
+    while (true) switch (try sel.await()) {
+        // stdin ended: half-close and keep delivering what the target still sends.
+        .up => conn.shutdown(io, .send) catch {},
+        .down => return .ok,
+    };
+}
+
+fn muxUp(io: Io, conn: Io.net.Stream) void {
+    var rb: [16 * 1024]u8 = undefined;
+    var r = Io.File.stdin().readerStreaming(io, &rb);
+    var wb: [64]u8 = undefined;
+    var w = conn.writer(io, &wb);
+    while (true) {
+        const data = r.interface.peekGreedy(1) catch return;
+        w.interface.writeAll(data) catch return;
+        w.interface.flush() catch return;
+        r.interface.toss(data.len);
+    }
+}
+
+fn muxDown(io: Io, conn: Io.net.Stream) void {
+    var rb: [16 * 1024]u8 = undefined;
+    var r = conn.reader(io, &rb);
+    var wb: [64]u8 = undefined;
+    var w = Io.File.stdout().writerStreaming(io, &wb);
+    while (true) {
+        const data = r.interface.peekGreedy(1) catch return;
+        w.interface.writeAll(data) catch return;
+        w.interface.flush() catch return;
+        r.interface.toss(data.len);
+    }
+}
+
+/// Starts the shared-session server of `dev` (`uucli __mux`) in its own process group, so that
+/// killing the ssh ProxyCommand does not end it, and waits until it is ready. Null: ready (or
+/// another client started one meanwhile); else the exit code, with the server's messages relayed.
+fn startMuxServer(app: *App, cfg_path: []const u8, dev: DeviceArg, sock: []const u8) !?Exit {
+    const io = app.io;
+    const cwd = Io.Dir.cwd();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try cwd.createDirPathStatus(io, try mux.dir(&dir_buf, cfg_path), .fromMode(0o700));
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock = try cwd.createFile(io, try mux.path(&lock_buf, cfg_path, dev.assist, dev.query, .lock), .{
+        .truncate = false,
+        .lock = .exclusive,
+        .permissions = .fromMode(0o600),
+    });
+    defer lock.close(io);
+    if ((try Io.net.UnixAddress.init(sock)).connect(io)) |c| {
+        c.close(io);
+        return null;
+    } else |_| {}
+    // A server that died without cleaning up leaves its socket file behind.
+    cwd.deleteFile(io, sock) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+    var log_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const log_path = try mux.path(&log_buf, cfg_path, dev.assist, dev.query, .log);
+    const log_file = try cwd.createFile(io, log_path, .{ .permissions = .fromMode(0o600) });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(app.arena, try std.process.executablePathAlloc(io, app.arena));
+    switch (log_level) {
+        .info => try argv.append(app.arena, "-v"),
+        .debug => try argv.append(app.arena, "-vv"),
+        else => {},
+    }
+    try argv.append(app.arena, "__mux");
+    if (dev.assist) try argv.append(app.arena, "--assist");
+    try argv.append(app.arena, dev.query);
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .{ .file = log_file },
+        .pgid = 0,
+    }) catch |err| {
+        log_file.close(io);
+        return app.fail(.other, "cannot start the shared session: {t}", .{err});
+    };
+    log_file.close(io);
+    const ready = blk: {
+        var rb: [16]u8 = undefined;
+        var r = child.stdout.?.readerStreaming(io, &rb);
+        const line = r.interface.takeDelimiterExclusive('\n') catch break :blk false;
+        break :blk std.mem.eql(u8, line, "ready");
+    };
+    child.stdout.?.close(io);
+    child.stdout = null;
+    if (ready) return null;
+    const term = child.wait(io) catch |err| return app.fail(.connect, "the shared session failed: {t}", .{err});
+    const text = cwd.readFileAlloc(io, log_path, app.arena, .limited(64 * 1024)) catch "";
+    app.err.writeAll(text) catch {};
+    return switch (term) {
+        .exited => |c| if (c == 0) app.fail(.connect, "the shared session ended before it was ready", .{}) else @fromBackingInt(c),
+        else => app.fail(.connect, "the shared session stopped: {f}", .{term}),
+    };
+}
+
+/// Internal (`uucli __mux [--assist] DEVICE`): one port mapping session for every `proxy` of
+/// DEVICE (spec §7.2). Prints `ready` on stdout once clients can connect; messages go to stderr
+/// (the mux log file). Ends after `UUCLI_MUX_IDLE` seconds (default 60) without streams, when the
+/// session ends, or on SIGINT/SIGTERM.
+fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
+    const io = app.io;
+    const assist = all_args.len != 0 and eql(all_args[0], "--assist");
+    const args = if (assist) all_args[1..] else all_args;
+    if (args.len != 1) return usage(app, "expected `__mux [--assist] DEVICE`", .{});
+    const dev: DeviceArg = .{ .query = args[0], .assist = assist };
+    const idle: Io.Duration = .fromSeconds(if (app.env.get("UUCLI_MUX_IDLE")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 60 else 60);
+    const cfg_path = try app.configPath();
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch
+        return app.fail(.other, "the config path is too long for a shared session", .{});
+
+    var cfg: config.Config = undefined;
+    var client: api.Client = undefined;
+    try signedInClient(app, &client, &cfg);
+    defer client.deinit();
+    const target = try resolveTarget(app, &client, &cfg, dev, false);
+
+    // Clients name their own targets; the rule only holds the stream count.
+    var pm = try portmap.PortMap.init(io, app.gpa, &.{.{ .lport = 0, .host = "-", .port = 1 }});
+    defer pm.deinit();
+    var bus_buf: [256]session.Event = undefined;
+    var bus: session.Bus = undefined;
+    try bus.init(io, &bus_buf);
+    defer bus.deinit();
+    try interrupts.install(&bus);
+
+    const s = session.Session.open(.{
+        .io = io,
+        .gpa = app.gpa,
+        .bus = &bus,
+        .client = &client,
+        .http = &client.http,
+        .own_device_id = cfg.device_id,
+        .target = target.id,
+        .capture_type = 9,
+        .assist_code = target.assist_code,
+    }) catch |err| return openFailure(app, err);
+    defer s.close();
+    pm.attach(s);
+    defer pm.detach();
+
+    const cwd = Io.Dir.cwd();
+    cwd.deleteFile(io, sock) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+    var server = (try Io.net.UnixAddress.init(sock)).listen(io, .{}) catch |err|
+        return app.fail(.other, "cannot listen on {s}: {t}", .{ sock, err });
+    defer server.deinit(io);
+    try pm.startMuxAccepting(&server);
+    defer pm.stopAccepting();
+    // First, so that no new client reaches a server that is going away.
+    defer cwd.deleteFile(io, sock) catch {};
+    var idle_task = try io.concurrent(muxIdleWatch, .{ io, &pm, &bus, idle });
+    defer idle_task.cancel(io) catch {};
+
+    app.out.writeAll("ready\n") catch {};
+    app.out.flush() catch {};
+    log.info("shared session ready on {s}", .{sock});
+    const end = s.run(pm.tool()) catch .interrupted;
+    return switch (end) {
+        .stopped => .ok,
+        .interrupted => interruptedExit(),
+        else => app.fail(.connect, "the session ended ({t})", .{end}),
+    };
+}
+
+/// Stops the session once no stream was open for `idle`.
+fn muxIdleWatch(io: Io, pm: *portmap.PortMap, bus: *session.Bus, idle: Io.Duration) Io.Cancelable!void {
+    var since = Io.Clock.awake.now(io);
+    while (true) {
+        try io.sleep(.fromSeconds(1), .awake);
+        const now = Io.Clock.awake.now(io);
+        if (pm.rules[0].streams.load(.monotonic) != 0) {
+            since = now;
+        } else if (now.compare(.gt, since.addDuration(idle))) {
+            log.info("no streams for {d} s, closing the shared session", .{@divTrunc(idle.nanoseconds, std.time.ns_per_s)});
+            bus.put(.stop);
+            return;
+        }
+    }
 }
 
 /// DEVICE as given: a device id or name (account devices, then favorites), or with `--assist` a
@@ -843,7 +1115,7 @@ fn sessionLoop(app: *App, l: LoopSetup) !Exit {
         first = false;
         const ready_at = Io.Clock.awake.now(io);
         l.pm.attach(s);
-        if (l.proxy) l.pm.startStream(&l.pm.rules[0], .stdio, true) catch |err| {
+        if (l.proxy) l.pm.startStream(&l.pm.rules[0], .stdio, true, null) catch |err| {
             l.pm.detach();
             s.close();
             return app.fail(.other, "cannot start the stream: {t}", .{err});
@@ -1452,6 +1724,7 @@ test {
     _ = @import("tools/terminal.zig");
     _ = @import("tools/files.zig");
     _ = @import("tty.zig");
+    _ = mux;
     _ = interrupts;
     _ = @import("e2e_test.zig");
     _ = @import("vectors_test.zig");

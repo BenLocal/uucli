@@ -679,6 +679,104 @@ test "portmap end to end through a fake host" {
     try closedByPeer(io, pm.rules[0].bound_port);
 }
 
+/// A shared-session client (spec §7.2): sends `request`, returns the reply line.
+fn muxConnect(io: Io, sock: []const u8, request: []const u8, reply_buf: []u8) !struct { conn: net.Stream, reply: []const u8 } {
+    const conn = try (try net.UnixAddress.init(sock)).connect(io);
+    errdefer conn.close(io);
+    var wb: [128]u8 = undefined;
+    var w = conn.writer(io, &wb);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var one: [1]u8 = undefined;
+    var r = conn.reader(io, &one);
+    var n: usize = 0;
+    while (true) {
+        const b = try r.interface.takeByte();
+        if (b == '\n') break;
+        reply_buf[n] = b;
+        n += 1;
+    }
+    return .{ .conn = conn, .reply = reply_buf[0..n] };
+}
+
+fn muxRoundTrip(io: Io, sock: []const u8, echo_port: u16, payload: []const u8) !void {
+    var req_buf: [64]u8 = undefined;
+    var reply_buf: [64]u8 = undefined;
+    const c = try muxConnect(io, sock, try std.fmt.bufPrint(&req_buf, "127.0.0.1 {d}\n", .{echo_port}), &reply_buf);
+    defer c.conn.close(io);
+    try testing.expectEqualStrings("OK", c.reply);
+    var wb: [4096]u8 = undefined;
+    var w = c.conn.writer(io, &wb);
+    try w.interface.writeAll(payload);
+    try w.interface.flush();
+    var got: [256]u8 = undefined;
+    var rb: [4096]u8 = undefined;
+    var r = c.conn.reader(io, &rb);
+    try r.interface.readSliceAll(got[0..payload.len]);
+    try testing.expectEqualSlices(u8, payload, got[0..payload.len]);
+}
+
+fn muxRoundTripTask(io: Io, sock: []const u8, echo_port: u16, payload: []const u8) Io.Cancelable!void {
+    muxRoundTrip(io, sock, echo_port, payload) catch |err| std.debug.print("second shared stream failed: {t}\n", .{err});
+}
+
+test "shared proxy session: clients name their targets over a unix socket" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    testing.log_level = .debug;
+
+    var echo = try (try net.IpAddress.parseIp4("127.0.0.1", 0)).listen(io, .{});
+    defer echo.deinit(io);
+    var echo_task = try io.concurrent(echoServer, .{ &echo, io });
+    defer echo_task.cancel(io) catch {};
+    const echo_port = echo.socket.address.getPort();
+
+    var e: Env = undefined;
+    try e.init(io, gpa);
+    defer e.deinit();
+    var pm = try portmap.PortMap.init(io, gpa, &.{.{ .lport = 0, .host = "-", .port = 1 }});
+    defer pm.deinit();
+    const s = try e.open(9);
+    defer s.close();
+    pm.attach(s);
+    var run_task = try io.concurrent(session.Session.run, .{ s, pm.tool() });
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sock_buf: [128]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&sock_buf, ".zig-cache/tmp/{s}/s.sock", .{tmp.sub_path});
+    var server = try (try net.UnixAddress.init(sock)).listen(io, .{});
+    defer server.deinit(io);
+    try pm.startMuxAccepting(&server);
+
+    try muxRoundTrip(io, sock, echo_port, "hello shared session");
+    // Two clients at once on the one session.
+    {
+        var g: Io.Group = .init;
+        defer g.cancel(io);
+        try g.concurrent(io, muxRoundTripTask, .{ io, sock, echo_port, "second client" });
+        try muxRoundTrip(io, sock, echo_port, "first client");
+        try g.await(io);
+    }
+    var reply_buf: [64]u8 = undefined;
+    {
+        const c = try muxConnect(io, sock, "reject.invalid 1\n", &reply_buf);
+        defer c.conn.close(io);
+        try testing.expectEqualStrings("ERR rejected", c.reply);
+    }
+    for ([_][]const u8{ "no-port\n", "host 0\n", " 22\n", "host 99999\n" }) |bad| {
+        const c = try muxConnect(io, sock, bad, &reply_buf);
+        defer c.conn.close(io);
+        try testing.expectEqualStrings("ERR request", c.reply);
+    }
+    try testing.expectEqual(@as(u32, 0), pm.rules[0].streams.load(.monotonic));
+
+    e.bus.put(.interrupt);
+    try testing.expectEqual(session.End.interrupted, try run_task.await(io));
+    pm.stopAccepting();
+    pm.detach();
+}
+
 fn roundTripTask(io: Io, port: u16, payload: []const u8, got: []u8) Io.Cancelable!void {
     roundTrip(io, port, payload, got) catch |err| std.debug.print("second stream failed: {t}\n", .{err});
 }

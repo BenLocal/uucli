@@ -63,25 +63,42 @@ const session_id = 1;
 
 const Frame = struct { kind: u64, data: []u8 };
 
-/// Where a stream's bytes come from and go to: an accepted TCP connection or stdin/stdout.
+/// Where a stream's bytes come from and go to: an accepted TCP connection, stdin/stdout, or a
+/// `proxy` client of the shared session (spec §7.2), which gets a reply line before the bytes.
 pub const Endpoint = union(enum) {
     tcp: net.Stream,
     stdio,
+    mux: net.Stream,
 
     fn shutdown(e: Endpoint, io: Io) void {
         switch (e) {
-            .tcp => |s| s.shutdown(io, .both) catch {},
+            .tcp, .mux => |s| s.shutdown(io, .both) catch {},
             .stdio => {},
         }
     }
 
     fn close(e: Endpoint, io: Io) void {
         switch (e) {
-            .tcp => |s| s.close(io),
+            .tcp, .mux => |s| s.close(io),
             .stdio => {},
         }
     }
 };
+
+/// Longest `HOST PORT` request line of a shared-session client, newline included.
+pub const max_mux_request = 300;
+const mux_request_timeout: Io.Duration = .fromSeconds(10);
+
+/// Parses a shared-session request `HOST PORT` (no newline).
+pub fn parseMuxRequest(line: []const u8) error{InvalidRequest}!struct { host: []const u8, port: u16 } {
+    const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidRequest;
+    const host = line[0..sp];
+    if (host.len == 0 or host.len > 255) return error.InvalidRequest;
+    for (host) |c| if (c <= ' ' or c == 0x7f) return error.InvalidRequest;
+    const port = std.fmt.parseInt(u16, line[sp + 1 ..], 10) catch return error.InvalidRequest;
+    if (port == 0) return error.InvalidRequest;
+    return .{ .host = host, .port = port };
+}
 
 const Stream = struct {
     pm: *PortMap,
@@ -89,6 +106,12 @@ const Stream = struct {
     rule: *RuleState,
     id: u64,
     endpoint: Endpoint,
+    host: []const u8,
+    port: u16,
+    /// `host` was allocated for this stream (shared-session clients name their own target).
+    owned_host: bool = false,
+    /// SYN-ACK received; a `mux` client got `OK`.
+    established: bool = false,
     inbox_buf: [64]Frame = undefined,
     inbox: Io.Queue(Frame) = undefined,
     /// `proxy`: ask the session loop to stop when this stream ends.
@@ -189,27 +212,133 @@ pub const PortMap = struct {
                     continue;
                 },
             };
-            pm.startStream(r, .{ .tcp = conn }, false) catch |err| {
+            pm.startStream(r, .{ .tcp = conn }, false, null) catch |err| {
                 log.info("connection on port {d} closed: {t}", .{ r.bound_port, err });
                 conn.close(pm.io);
             };
         }
     }
 
-    /// Opens a stream for `endpoint` on the current session.
-    pub fn startStream(pm: *PortMap, r: *RuleState, endpoint: Endpoint, stop_session: bool) !void {
+    /// Accepts shared-session clients on `server` (spec §7.2): each sends `HOST PORT` and gets a
+    /// stream to that target. Runs until `deinit`; the caller owns `server`.
+    pub fn startMuxAccepting(pm: *PortMap, server: *net.Server) !void {
+        try pm.accept_group.concurrent(pm.io, muxAcceptTask, .{ pm, server });
+    }
+
+    /// Stops accepting shared-session clients (before the socket file goes away).
+    pub fn stopAccepting(pm: *PortMap) void {
+        pm.accept_group.cancel(pm.io);
+    }
+
+    fn muxAcceptTask(pm: *PortMap, server: *net.Server) Io.Cancelable!void {
+        var handshakes: Io.Group = .init;
+        defer handshakes.cancel(pm.io);
+        while (true) {
+            const conn = server.accept(pm.io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => {
+                    log.warn("accept failed: {t}", .{err});
+                    try pm.io.sleep(.fromMilliseconds(100), .awake);
+                    continue;
+                },
+            };
+            handshakes.concurrent(pm.io, muxHandshake, .{ pm, conn }) catch conn.close(pm.io);
+        }
+    }
+
+    /// Reads one `HOST PORT` line (unbuffered: the client sends nothing else before `OK`).
+    fn muxHandshake(pm: *PortMap, conn: net.Stream) Io.Cancelable!void {
+        const io = pm.io;
+        var line_buf: [max_mux_request]u8 = undefined;
+        const line = readLineTimed(io, conn, &line_buf) catch |err| {
+            if (err == error.Canceled) {
+                conn.close(io);
+                return error.Canceled;
+            }
+            log.info("shared-session request dropped: {t}", .{err});
+            muxReply(io, conn, "ERR request\n");
+            conn.close(io);
+            return;
+        };
+        const req = parseMuxRequest(line) catch {
+            muxReply(io, conn, "ERR request\n");
+            conn.close(io);
+            return;
+        };
+        const host = pm.gpa.dupe(u8, req.host) catch {
+            conn.close(io);
+            return;
+        };
+        pm.startStream(&pm.rules[0], .{ .mux = conn }, false, .{ .host = host, .port = req.port }) catch |err| {
+            log.info("shared-session stream not started: {t}", .{err});
+            pm.gpa.free(host);
+            muxReply(io, conn, "ERR failed\n");
+            conn.close(io);
+        };
+    }
+
+    fn readLineTimed(io: Io, conn: net.Stream, buf: []u8) ![]const u8 {
+        const U = union(enum) { line: anyerror![]const u8, timeout: Io.Cancelable!void };
+        var sel_buf: [2]U = undefined;
+        var sel: Io.Select(U) = .init(io, &sel_buf);
+        defer sel.cancelDiscard();
+        try sel.concurrent(.line, readLine, .{ io, conn, buf });
+        try sel.concurrent(.timeout, Io.sleep, .{ io, mux_request_timeout, .awake });
+        return switch (try sel.await()) {
+            .timeout => error.Timeout,
+            .line => |l| l,
+        };
+    }
+
+    fn readLine(io: Io, conn: net.Stream, buf: []u8) anyerror![]const u8 {
+        var one: [1]u8 = undefined;
+        var r = conn.reader(io, &one);
+        var n: usize = 0;
+        while (true) {
+            const b = r.interface.takeByte() catch |err| switch (err) {
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => return r.err orelse error.ReadFailed,
+            };
+            if (b == '\n') return buf[0..n];
+            if (n == buf.len) return error.LineTooLong;
+            buf[n] = b;
+            n += 1;
+        }
+    }
+
+    fn muxReply(io: Io, conn: net.Stream, line: []const u8) void {
+        var buf: [32]u8 = undefined;
+        var w = conn.writer(io, &buf);
+        w.interface.writeAll(line) catch return;
+        w.interface.flush() catch {};
+    }
+
+    /// Opens a stream for `endpoint` on the current session, to the rule's target or to `to`.
+    /// A `to.host` is owned by the stream once this succeeds; on error the caller still owns it.
+    pub fn startStream(pm: *PortMap, r: *RuleState, endpoint: Endpoint, stop_session: bool, to: ?struct { host: []const u8, port: u16 }) !void {
         pm.mutex.lockUncancelable(pm.io);
         defer pm.mutex.unlock(pm.io);
         const s = pm.session orelse return error.NotConnected;
         if (r.streams.load(.monotonic) >= max_streams_per_rule) return error.TooManyStreams;
         const st = try pm.gpa.create(Stream);
         errdefer pm.gpa.destroy(st);
-        st.* = .{ .pm = pm, .session = s, .rule = r, .id = pm.next_id.fetchAdd(1, .monotonic), .endpoint = endpoint, .stop_session = stop_session };
+        st.* = .{
+            .pm = pm,
+            .session = s,
+            .rule = r,
+            .id = pm.next_id.fetchAdd(1, .monotonic),
+            .endpoint = endpoint,
+            .host = if (to) |t| t.host else r.rule.host,
+            .port = if (to) |t| t.port else r.rule.port,
+            .stop_session = stop_session,
+        };
         st.inbox = .init(&st.inbox_buf);
         try pm.streams.put(pm.gpa, .{ r.id, st.id }, st);
         errdefer _ = pm.streams.remove(.{ r.id, st.id });
         _ = r.streams.fetchAdd(1, .monotonic);
         errdefer _ = r.streams.fetchSub(1, .monotonic);
+        // Before the task starts: it may end (and free the host) at once.
+        st.owned_host = to != null;
         try pm.group.concurrent(pm.io, streamTask, .{st});
     }
 
@@ -261,9 +390,19 @@ pub const PortMap = struct {
             st.endpoint.close(io);
             _ = st.rule.streams.fetchSub(1, .monotonic);
             if (st.stop_session) st.session.bus.put(.stop);
+            if (st.owned_host) pm.gpa.free(st.host);
             pm.gpa.destroy(st);
         }
         const result = forward(st);
+        if (st.endpoint == .mux and !st.established) {
+            const prev = io.swapCancelProtection(.blocked);
+            muxReply(io, st.endpoint.mux, if (result) |_| "ERR failed\n" else |err| switch (err) {
+                error.Rejected => "ERR rejected\n",
+                error.SynTimeout => "ERR timeout\n",
+                else => "ERR failed\n",
+            });
+            _ = io.swapCancelProtection(prev);
+        }
         // Always tell the host the stream is over (best effort; the session may be gone).
         const prev = io.swapCancelProtection(.blocked);
         sendFrame(st, wire.PortFrame.close, "") catch {};
@@ -286,7 +425,7 @@ pub const PortMap = struct {
     fn forward(st: *Stream) !void {
         const pm = st.pm;
         const io = pm.io;
-        const syn = try std.json.Stringify.valueAlloc(pm.gpa, .{ .version = 1, .target_host = st.rule.rule.host, .target_port = st.rule.rule.port }, .{});
+        const syn = try std.json.Stringify.valueAlloc(pm.gpa, .{ .version = 1, .target_host = st.host, .target_port = st.port }, .{});
         defer pm.gpa.free(syn);
         try sendFrame(st, wire.PortFrame.syn, syn);
 
@@ -301,6 +440,13 @@ pub const PortMap = struct {
             return error.Rejected;
         }
         log.debug("stream {d} established", .{st.id});
+        if (st.endpoint == .mux) {
+            var buf: [8]u8 = undefined;
+            var w = st.endpoint.mux.writer(io, &buf);
+            try w.interface.writeAll("OK\n");
+            try w.interface.flush();
+        }
+        st.established = true;
 
         const U = union(enum) { up: anyerror!void, down: anyerror!void };
         var buf: [2]U = undefined;
@@ -353,7 +499,7 @@ pub const PortMap = struct {
         const io = st.pm.io;
         var buf: [max_frame_payload]u8 = undefined;
         switch (st.endpoint) {
-            .tcp => |conn| {
+            .tcp, .mux => |conn| {
                 var r = conn.reader(io, &buf);
                 return pump(st, &r.interface);
             },
@@ -380,7 +526,7 @@ pub const PortMap = struct {
         const io = st.pm.io;
         var buf: [max_frame_payload]u8 = undefined;
         switch (st.endpoint) {
-            .tcp => |conn| {
+            .tcp, .mux => |conn| {
                 var w = conn.writer(io, &buf);
                 return drain(st, &w.interface);
             },
@@ -414,6 +560,15 @@ pub const PortMap = struct {
 };
 
 const testing = std.testing;
+
+test "shared-session requests" {
+    const r = try parseMuxRequest("10.0.5.134 22");
+    try testing.expectEqualStrings("10.0.5.134", r.host);
+    try testing.expectEqual(@as(u16, 22), r.port);
+    try testing.expectEqualStrings("::1", (try parseMuxRequest("::1 8080")).host);
+    for ([_][]const u8{ "", "host", "host ", " 22", "host 0", "host 65536", "host 22 x", "ho\tst 22", "host -1" }) |bad|
+        try testing.expectError(error.InvalidRequest, parseMuxRequest(bad));
+}
 
 test "parseRule" {
     const r1 = try parseRule("2222:127.0.0.1:22");
