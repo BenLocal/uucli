@@ -83,6 +83,29 @@ take turns (one at a time per device, the others wait) while the streams keep ru
 or `UUCLI_MUX=0` uses a connection of its own (as does `portmap --no-reconnect`); that ends the
 shared one.
 
+## Manage shared connections
+
+```sh
+uucli session start office-pc          # connect and keep it open
+uucli session list --json              # live local connections for this config
+uucli session status office-pc --json  # port streams, active tool and waiting tools
+uucli session stop office-pc           # refuse while in use
+uucli session stop office-pc --force   # interrupt users and close
+```
+
+Explicitly started connections stay open until stopped or disconnected, overriding the idle
+timeout. Repeating `start` reuses the connection; existing `exec`, `terminal`, `files`, `proxy`
+and `portmap` commands use it automatically. Device names and IDs share one connection.
+Use `session start --assist SHARE_ID` for remote assistance; favorites work by name as usual.
+
+List, status and stop query local connections without contacting the cloud or asking for a
+code. An absent status exits 4; stopping an absent connection succeeds. `--json` is supported
+by list / status, and `session ls` is an alias for list. These sessions keep the connection;
+`exec` still runs each command in a new shell. Kept connections do not reconnect in the
+background; subsequent commands can establish a new connection on demand.
+
+After upgrading, stop background processes from older versions before using session management.
+
 ## Remote terminal
 
 ```sh

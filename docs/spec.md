@@ -84,6 +84,10 @@ is a share id, joined by code.
 | `uucli fav add ID [NAME] [--save-code]` | — | Adds share `ID` to the favorites with remark `NAME` (§5.5). `--save-code` also stores its code in the config (§5.6). Adding an existing favorite again replaces its remark (verified 2026-11-16), so this also renames. |
 | `uucli fav edit NAME\|ID [NEW_NAME] [--save-code]` | — | Changes a favorite (resolved like §3.3 step 4; exit 4 when absent): `NEW_NAME` re-adds it with that remark and its original `favorited_at`; `--save-code` replaces the code in the config. At least one of the two, else exit 2. |
 | `uucli fav rm\|remove NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
+| `uucli session start DEVICE [--assist]` | — | Opens or reuses the local shared connection and keeps it until stopped or disconnected (§7.4). |
+| `uucli session list [--json]` | — | Lists live local shared connections for the selected config (§7.4). `ls` is also accepted. |
+| `uucli session status DEVICE [--assist] [--json]` | — | Shows one local shared connection without contacting the cloud (§7.4). |
+| `uucli session stop DEVICE [--assist] [--force]` | — | Stops an idle shared connection; `--force` also interrupts its users (§7.4). |
 | `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect] [--no-mux]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
 | `uucli proxy [--no-mux] DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. By default the stream goes through the shared session of DEVICE (§7.2); `--no-mux` opens a session of its own. Exits when the stream ends. |
 | `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). `terminal`, `exec` and `files` run on a lease of the shared session (§7.3); `--no-mux` opens a session of their own. |
@@ -358,8 +362,9 @@ temporary code may stop working after it was used; a wrong or expired code fails
 
 ## 6. Connection setup (M2)
 
-One **session** = one room join + one signaling socket + one PeerConnection, opened for one tool.
-Each tool uses its own capture type; a session serves exactly one tool.
+One **session** = one room join + one signaling socket + one PeerConnection.
+Direct connections use the tool's capture type below. A shared connection uses capture type 9
+and serves port streams plus terminal / exec / files leases (§7.2–§7.4).
 
 | Tool | `capture_type` | Channels the tool waits for |
 | --- | --- | --- |
@@ -584,8 +589,11 @@ A host keeps one controller session at a time: a second session to it ends the f
 process (internal command; not a stable interface).
 
 - Files in `CONFIG_DIR/mux/` (mode 0700), named `HASH.sock`, `HASH.lock`, `HASH.log` (0600). HASH
-  is a 64-bit Wyhash of the config path, `--assist`, and DEVICE as written, so different accounts
-  and spellings of DEVICE get separate sessions.
+  is a 64-bit Wyhash of the config path, connection mode (account device or assistance), and
+  resolved device / share ID. Names and IDs for the same target share one connection; favorites
+  and explicit `--assist` requests for the same share ID also share one connection. Different
+  config paths and connection modes get separate sessions. Target resolution precedes the
+  socket lookup for proxy, portmap and tool leases.
 - `proxy` connects to `HASH.sock`. If that fails it takes an exclusive `flock` on `HASH.lock`,
   tries again (another `proxy` may have started a server meanwhile), removes a stale socket file,
   and starts `__mux` with its own process group (an ssh client killing the ProxyCommand's group
@@ -607,8 +615,9 @@ process (internal command; not a stable interface).
   `--no-reconnect` keeps the own-session behavior of §7.1 (it must fail when the session ends).
 - The server opens the session like `portmap` (capture type 9) but does not reconnect: when the
   session ends it removes the socket file and exits, closing its streams; the next `proxy` starts
-  a new one. It also ends after `UUCLI_MUX_IDLE` seconds (default 60) without streams, and on
-  SIGINT / SIGTERM. The socket file is removed before the listener closes.
+  a new one. Unless explicitly kept by `session start` (§7.4), it also ends after `UUCLI_MUX_IDLE`
+  seconds (default 60) without port streams or active / waiting leases. All shared connections
+  end on SIGINT / SIGTERM. The socket file is removed before the listener closes.
 - An assistance code comes from `UUCLI_ASSIST_CODE` (inherited) or the config; the server never
   prompts.
 - Off with `--no-mux` or `UUCLI_MUX=0` (also `false`, `no`, `off`), and when the socket path would
@@ -639,6 +648,61 @@ clients take turns instead of being multiplexed:
   the client then opens a session of its own.
 - SIGINT / SIGTERM reach the tool as before (Ctrl-C to the remote command, cancel the transfer,
   detach); the lease is returned when the client exits.
+
+### 7.4 Local connection management
+
+`session` manages the same `__mux` connections used by existing commands. It does not preserve
+shell variables or working directories across `exec` calls; each exec still opens and ends a
+remote shell (§11.1.1).
+
+- `session start DEVICE [--assist]`: first looks for a live local connection by exact ID, then
+  case-insensitive name. Reuses it and disables idle expiry. Otherwise resolves DEVICE like
+  other tools, starts the server through the existing startup lock, waits for ready, and keeps
+  it. Repeated starts are idempotent. Prints `Keeping session for ID` to stderr; stdout is empty.
+  New assistance connections obtain a code as in §5.5; keeping an existing connection needs no
+  cloud request or code prompt. Explicit start works even when `UUCLI_MUX=0`.
+- Keeping lasts until `session stop`, SIGINT / SIGTERM of the server, or connection loss. It
+  does not reconnect automatically or survive a restart. The next tool invocation can start
+  a new automatic connection, with the normal idle timeout.
+- `session list [-j]` (also `session ls`) queries live Unix sockets in the selected config's
+  mux directory, filters by config-path scope, and ignores stale sockets, non-socket entries,
+  servers that do not answer, and servers predating management support. No cloud or login
+  request is made, and no server is started. The list can be empty.
+- `session status DEVICE [--assist] [-j]` uses the same local list. ID matches take precedence;
+  names match exactly ignoring case, using the name recorded when the server started. Ambiguous
+  matches exit 2; an absent session exits 4. With `--assist`, only assistance IDs match. Explicit
+  assistance connections without a favorite name are addressed by share ID.
+- Tables have columns `DEVICE NAME ASSIST MODE STREAMS ACTIVE WAITING`, separated by tabs.
+  `MODE` is `kept` or `auto`. `STREAMS` counts port streams, including pending opens; `ACTIVE`
+  is 0 or 1 for the tool lease holder; `WAITING` counts waiting tool clients. Counts are live
+  snapshots. JSON list output is an array; status output is one object. Each object contains
+  `device`, `name`, `assist` (boolean), `pinned` (boolean), `streams`, `active`, `waiting`.
+- `session stop DEVICE [--assist] [-f|--force]`: without force, refuses when any port stream or
+  active / waiting lease exists (exit 6). Force interrupts them. A successful request removes
+  the socket during teardown; the command waits up to 5 seconds for it to become unreachable
+  and prints `Stopped session for ID` to stderr. An absent session is already stopped (exit 0,
+  no output). A stop reply error or a server still reachable after 5 seconds exits 5.
+- `--json` is accepted only by list / status; `--force` only by stop. Invalid combinations exit 2.
+  There is no short alias for `session`.
+
+Local management requests are single newline-terminated lines, independent of the lease queue:
+
+| Request | Reply |
+| --- | --- |
+| `STATUS` | One JSON status object followed by a newline |
+| `KEEPALIVE` | Sets `pinned=true`, then returns the same status format |
+| `STOP` | `ERR busy` if in use, otherwise `OK` and stops the session loop |
+| `STOP FORCE` | `OK` and stops the session loop, including streams and leases |
+
+Stopping servers answer management requests with `ERR stopping`. Internal status includes
+`scope`, a 64-bit Wyhash of the config path (seed `0x73657373696f6e`); the CLI omits it from
+public JSON. Replies must arrive within 10 seconds and fit in 4096 bytes excluding the newline.
+The keep flag and idle expiry share a mutex so a successful keep cannot race with idle expiry.
+Management does not acquire a tool lease or reset idle time merely by reading status.
+The startup process passes the resolved target name through internal `UUCLI_MUX_NAME` so
+favorites retain their local display name when the child is addressed by canonical share ID.
+Old background processes do not implement this protocol; stop them before managing or reusing
+connections with the new version. Old sockets keyed by a device name are not migrated.
 
 ## 8. Concurrency model
 
@@ -678,6 +742,8 @@ uucli/
     ├── ws.zig             # WebSocket client
     ├── signal.zig         # Engine.IO/Socket.IO framing, control request, soac
     ├── rtc.zig            # libdatachannel binding, event queue
+    ├── mux.zig            # shared socket paths, management protocol and keep / idle state
+    ├── lease.zig          # serial tool leases on the shared connection
     ├── session.zig        # join → signal → rtc → echo → ready; routing
     ├── interrupts.zig     # SIGINT/SIGTERM self-pipe → session bus
     ├── wire.zig           # protobuf wire encode/decode, envelope, echo, connect options
@@ -921,6 +987,7 @@ Real-device log:
 | 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
 | 2026-11-17 | Shared `proxy` session (§7.2), Linux hosts behind a remote-assistance host | passed: 3 concurrent `proxy` and 7 concurrent ssh logins (ah, ProxyCommand) to 7 machines behind one host through one `__mux` process; before, a second concurrent session ended the first (`released`) or failed (`RoomClosed`). Unknown DEVICE relayed as exit 4; idle exit after 60 s removed the socket; `--no-mux` and `UUCLI_MUX=0` connect directly |
 | 2026-11-17 | Leases on the shared session (§7.3), official Windows host | passed while an ssh `proxy` stream stayed up on the same session: `exec` (≈5.7 s with a new server, then about 1 s), two `exec` at once (served one after the other), `files ls` (0.5 s) and `files get` (92-byte file), `terminal --list`, an interactive `terminal` with `~.` (exit 0). The host lists one terminal session and reuses its id for every open |
+| 2026-11-17 | Local session management (§7.4) | Offline tests passed with Unix sockets and the in-process RTC host: repeated keep, idle expiry, management during active / waiting leases, busy stop refusal and forced teardown. CLI tests cover config isolation, names / IDs, stale sockets, JSON, and idempotent start / stop. Real-host validation is pending: device discovery and system curl both failed to resolve the API hostname. |
 
 ## 13. Open questions and protocol drift
 

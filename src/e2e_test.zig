@@ -17,6 +17,7 @@ const portmap = @import("tools/portmap.zig");
 const terminal = @import("tools/terminal.zig");
 const files = @import("tools/files.zig");
 const lease = @import("lease.zig");
+const mux = @import("mux.zig");
 
 const host_client_id = "host-1";
 
@@ -740,6 +741,18 @@ test "shared proxy session: clients name their targets over a unix socket" {
     const s = try e.open(9);
     defer s.close();
     pm.attach(s);
+    var leases: lease.Server = .{ .io = io, .gpa = gpa, .link = s.link(), .platform = 1, .pm = &pm };
+    var control: mux.Control = .{
+        .io = io,
+        .pm = &pm,
+        .leases = &leases,
+        .bus = &e.bus,
+        .device = "host-1",
+        .name = "office-pc",
+        .assist = false,
+        .config_scope = 1,
+    };
+    pm.management_hook = control.hook();
     var run_task = try io.concurrent(session.Session.run, .{ s, pm.tool() });
 
     var tmp = testing.tmpDir(.{});
@@ -770,10 +783,23 @@ test "shared proxy session: clients name their targets over a unix socket" {
         defer c.conn.close(io);
         try testing.expectEqualStrings("ERR request", c.reply);
     }
+    {
+        var request: [64]u8 = undefined;
+        const stream = try muxConnect(io, sock, try std.fmt.bufPrint(&request, "127.0.0.1 {d}\n", .{echo_port}), &reply_buf);
+        defer stream.conn.close(io);
+        try testing.expectEqualStrings("OK", stream.reply);
+        const busy = try muxConnect(io, sock, "STOP\n", &reply_buf);
+        defer busy.conn.close(io);
+        try testing.expectEqualStrings("ERR busy", busy.reply);
+    }
+    var closing: u32 = 0;
+    while (pm.rules[0].streams.load(.monotonic) != 0 and closing < 100) : (closing += 1)
+        try io.sleep(.fromMilliseconds(10), .awake);
     try testing.expectEqual(@as(u32, 0), pm.rules[0].streams.load(.monotonic));
 
-    e.bus.put(.interrupt);
-    try testing.expectEqual(session.End.interrupted, try run_task.await(io));
+    var since = Io.Clock.awake.now(io).subDuration(.fromSeconds(60));
+    try testing.expect(control.expire(&since, .fromSeconds(0)));
+    try testing.expectEqual(session.End.stopped, try run_task.await(io));
     pm.stopAccepting();
     pm.detach();
 }
@@ -938,6 +964,17 @@ test "terminal on a lease of the shared session, next to a port stream" {
     pm.attach(s);
     var leases: lease.Server = .{ .io = io, .gpa = gpa, .link = s.link(), .platform = 1, .pm = &pm };
     pm.lease_hook = leases.hook();
+    var control: mux.Control = .{
+        .io = io,
+        .pm = &pm,
+        .leases = &leases,
+        .bus = &env.bus,
+        .device = "host-1",
+        .name = "office-pc",
+        .assist = false,
+        .config_scope = mux.scope("config.json"),
+    };
+    pm.management_hook = control.hook();
     var run_task = try io.concurrent(session.Session.run, .{ s, leases.tool() });
 
     var tmp = testing.tmpDir(.{});
@@ -947,6 +984,27 @@ test "terminal on a lease of the shared session, next to a port stream" {
     var server = try (try net.UnixAddress.init(sock)).listen(io, .{});
     defer server.deinit(io);
     try pm.startMuxAccepting(&server);
+
+    var management_reply: [4096]u8 = undefined;
+    {
+        const c = try muxConnect(io, sock, "STATUS\n", &management_reply);
+        defer c.conn.close(io);
+        const status = try std.json.parseFromSlice(mux.Status, gpa, c.reply, .{});
+        defer status.deinit();
+        try testing.expect(!status.value.pinned);
+        try testing.expectEqualStrings("host-1", status.value.device);
+        try testing.expectEqual(@as(u32, 0), status.value.active);
+    }
+    // Explicit starts are idempotent and defeat idle expiry without occupying a lease.
+    for (0..2) |_| {
+        const c = try muxConnect(io, sock, "KEEPALIVE\n", &management_reply);
+        defer c.conn.close(io);
+        const status = try std.json.parseFromSlice(mux.Status, gpa, c.reply, .{});
+        defer status.deinit();
+        try testing.expect(status.value.pinned);
+    }
+    var since = Io.Clock.awake.now(io).subDuration(.fromSeconds(60));
+    try testing.expect(!control.expire(&since, .fromSeconds(0)));
 
     // The lease client: request, `OK PLATFORM`, then frames.
     const conn = try (try net.UnixAddress.init(sock)).connect(io);
@@ -986,6 +1044,31 @@ test "terminal on a lease of the shared session, next to a port stream" {
     try t.checkEnv();
     const id = try t.open(arena.allocator(), 0, 80, 24);
     try testing.expectEqual(@as(u32, 5), id);
+    const waiting = try (try net.UnixAddress.init(sock)).connect(io);
+    defer waiting.close(io);
+    {
+        var wb: [16]u8 = undefined;
+        var w = waiting.writer(io, &wb);
+        try w.interface.writeAll("LEASE\n");
+        try w.interface.flush();
+    }
+    var queued: u32 = 0;
+    while (leases.clients.load(.monotonic) < 2 and queued < 100) : (queued += 1)
+        try io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expectEqual(@as(u32, 2), leases.clients.load(.monotonic));
+
+    // Management responds while a terminal holds the lease, and a normal stop refuses it.
+    {
+        const c = try muxConnect(io, sock, "STOP\n", &management_reply);
+        defer c.conn.close(io);
+        try testing.expectEqualStrings("ERR busy", c.reply);
+        const d = try muxConnect(io, sock, "STATUS\n", &management_reply);
+        defer d.conn.close(io);
+        const status = try std.json.parseFromSlice(mux.Status, gpa, d.reply, .{});
+        defer status.deinit();
+        try testing.expectEqual(@as(u32, 1), status.value.active);
+        try testing.expectEqual(@as(u32, 1), status.value.waiting);
+    }
     // A port stream on the same session while the lease is held.
     try muxRoundTrip(io, sock, echo.socket.address.getPort(), "port stream beside a lease");
     var out: Io.Writer.Allocating = .init(gpa);
@@ -996,7 +1079,27 @@ test "terminal on a lease of the shared session, next to a port stream" {
     t.post(.{ .input = try gpa.dupe(u8, "exit\r") });
     try testing.expectEqual(terminal.Outcome{ .exited = 3 }, try t.attach(.{ .id = id, .out = &out.writer, .err = &err.writer, .escape = '~', .tty = true, .size = smallSize }));
     try testing.expectEqualStrings("hi\r", out.written());
-    try testing.expectEqual(@as(u32, 1), leases.clients.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), leases.clients.load(.monotonic));
+
+    var forwarded_request: [64]u8 = undefined;
+    const forwarded = try muxConnect(io, sock, try std.fmt.bufPrint(&forwarded_request, "127.0.0.1 {d}\n", .{echo.socket.address.getPort()}), &management_reply);
+    defer forwarded.conn.close(io);
+    try testing.expectEqualStrings("OK", forwarded.reply);
+    try testing.expectEqual(@as(u32, 1), pm.rules[0].streams.load(.monotonic));
+
+    // Forced shutdown interrupts port streams, the lease holder and queued lease clients.
+    {
+        const c = try muxConnect(io, sock, "STOP FORCE\n", &management_reply);
+        defer c.conn.close(io);
+        try testing.expectEqualStrings("OK", c.reply);
+    }
+    try testing.expectEqual(session.End.stopped, try run_task.await(io));
+    pm.stopAccepting();
+    pm.detach();
+    var eof_buf: [1]u8 = undefined;
+    var forwarded_reader = forwarded.conn.reader(io, &eof_buf);
+    try testing.expectError(error.EndOfStream, forwarded_reader.interface.takeByte());
+    try testing.expectEqual(@as(u32, 0), pm.rules[0].streams.load(.monotonic));
 
     // Returning the lease: the server notices the closed connection.
     conn.shutdown(io, .both) catch {};
@@ -1005,11 +1108,6 @@ test "terminal on a lease of the shared session, next to a port stream" {
     var waited: u32 = 0;
     while (leases.clients.load(.monotonic) != 0 and waited < 100) : (waited += 1) try io.sleep(.fromMilliseconds(20), .awake);
     try testing.expectEqual(@as(u32, 0), leases.clients.load(.monotonic));
-
-    env.bus.put(.interrupt);
-    try testing.expectEqual(session.End.interrupted, try run_task.await(io));
-    pm.stopAccepting();
-    pm.detach();
 }
 
 test "remote-assistance join falls back to v1 and reaches a working session" {

@@ -55,6 +55,8 @@ const usage_text =
     \\  fav edit NAME|ID [NEW_NAME] [--save-code]
     \\                                          Rename a favorite and/or replace its saved code
     \\  fav rm|remove NAME|ID                   Remove a favorite and its saved code
+    \\  session start DEVICE                  Open and keep a shared connection
+    \\  session list [--json] | status DEVICE [--json] | stop DEVICE [--force]
     \\  portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect] [--no-mux]
     \\  proxy [--no-mux] DEVICE HOST PORT       Connect stdin/stdout to HOST:PORT (ssh ProxyCommand);
     \\                                          all commands share one background connection per DEVICE
@@ -66,7 +68,7 @@ const usage_text =
     \\                                          and exit with its exit status
     \\
     \\DEVICE is a device id or name from `device list` or `fav list`. With --assist (portmap, proxy,
-    \\terminal, exec, files), DEVICE is the share id of a host offering remote assistance. Its code
+    \\terminal, exec, files, session), DEVICE is the share id of a host offering remote assistance. Its code
     \\comes from UUCLI_ASSIST_CODE, the config (fav add --save-code), or is asked for.
     \\Interactive terminal/exec saves entered codes after connection and prompts again for rejected codes.
     \\
@@ -81,7 +83,7 @@ const usage_text =
     \\
     \\Environment: UUCLI_CONFIG (config file), UUCLI_USE_PROXY=1 (honor HTTP(S)_PROXY),
     \\  UUCLI_ASSIST_CODE (remote-assistance code), UUCLI_MUX=0 (no shared connection),
-    \\  UUCLI_MUX_IDLE (seconds a shared connection stays open without streams, default 60)
+    \\  UUCLI_MUX_IDLE (idle seconds for automatic connections, default 60)
     \\
 ;
 
@@ -206,6 +208,8 @@ fn run(app: *App, all_args: []const [:0]const u8) Exit {
         cmdDevice(app, rest)
     else if (eql(cmd, "fav"))
         cmdFav(app, rest)
+    else if (eql(cmd, "session"))
+        cmdSession(app, rest)
     else if (eql(cmd, "portmap"))
         cmdPortmap(app, rest)
     else if (eql(cmd, "proxy"))
@@ -625,7 +629,7 @@ fn cmdPortmap(app: *App, args: []const [:0]const u8) !Exit {
     try app.err.flush();
     // `--no-reconnect` asks to fail when the session ends; only an own session can do that.
     if (shared and reconnect)
-        if (try portmapViaMux(app, .{ .query = query, .assist = assist }, target.assist_code, &pm)) |code| return code;
+        if (try portmapViaMux(app, sharedDevice(target), target.assist_code, &pm)) |code| return code;
 
     var bus_buf: [256]session.Event = undefined;
     var bus: session.Bus = undefined;
@@ -661,7 +665,6 @@ fn cmdProxy(app: *App, all_args: []const [:0]const u8) !Exit {
     const port = std.fmt.parseInt(u16, args[2], 10) catch 0;
     if (port == 0 or args[1].len == 0 or args[1].len > 255) return usage(app, "invalid HOST PORT", .{});
     for (args[1]) |c| if (c <= ' ' or c == 0x7f) return usage(app, "invalid HOST PORT", .{});
-    if (shared) if (try proxyViaMux(app, .{ .query = args[0], .assist = assist }, args[1], port)) |code| return code;
 
     var cfg: config.Config = undefined;
     var client: api.Client = undefined;
@@ -669,6 +672,8 @@ fn cmdProxy(app: *App, all_args: []const [:0]const u8) !Exit {
     defer client.deinit();
     // stdin carries the stream, so a code cannot be read from it.
     const target = try resolveTarget(app, &client, &cfg, .{ .query = args[0], .assist = assist }, false);
+
+    if (shared) if (try proxyViaMux(app, sharedDevice(target), target.assist_code, args[1], port)) |code| return code;
 
     var pm = try portmap.PortMap.init(app.io, app.gpa, &.{.{ .lport = 0, .host = args[1], .port = port }});
     defer pm.deinit();
@@ -691,6 +696,183 @@ fn cmdProxy(app: *App, all_args: []const [:0]const u8) !Exit {
     });
 }
 
+// --- shared connection management (spec §7.4) --------------------------------------------------
+
+/// Management never starts a server except for an explicit `session start`.
+fn sessionRequest(app: *App, sock: []const u8, request: []const u8) !?[]const u8 {
+    const conn = (try Io.net.UnixAddress.init(sock)).connect(app.io) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => return null,
+        else => return err,
+    };
+    defer conn.close(app.io);
+    var wb: [64]u8 = undefined;
+    var w = conn.writer(app.io, &wb);
+    try w.interface.print("{s}\n", .{request});
+    try w.interface.flush();
+    var line: [4096]u8 = undefined;
+    const reply = try portmap.PortMap.readLineTimed(app.io, conn, &line);
+    return try app.arena.dupe(u8, reply);
+}
+
+const LocalSession = struct { sock: []const u8, status: mux.Status };
+const SessionInfo = struct {
+    device: []const u8,
+    name: []const u8,
+    assist: bool,
+    pinned: bool,
+    streams: u32,
+    active: u32,
+    waiting: u32,
+
+    fn from(s: mux.Status) SessionInfo {
+        return .{ .device = s.device, .name = s.name, .assist = s.assist, .pinned = s.pinned, .streams = s.streams, .active = s.active, .waiting = s.waiting };
+    }
+};
+
+fn localSessions(app: *App, cfg_path: []const u8) ![]LocalSession {
+    var found: std.ArrayList(LocalSession) = .empty;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try mux.dir(&dir_buf, cfg_path);
+    var dir = Io.Dir.cwd().openDir(app.io, base, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    defer dir.close(app.io);
+    var it = dir.iterate();
+    while (try it.next(app.io)) |entry| {
+        if (entry.kind != .unix_domain_socket or !std.mem.endsWith(u8, entry.name, ".sock")) continue;
+        const sock = try std.fs.path.join(app.arena, &.{ base, entry.name });
+        const reply = sessionRequest(app, sock, "STATUS") catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            else => continue,
+        } orelse continue;
+        const status = std.json.parseFromSliceLeaky(mux.Status, app.arena, reply, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        if (status.scope == mux.scope(cfg_path)) try found.append(app.arena, .{ .sock = sock, .status = status });
+    }
+    return found.toOwnedSlice(app.arena);
+}
+
+fn printSession(app: *App, s: mux.Status) !void {
+    try app.out.print("{s}\t{s}\t{s}\t{s}\t{d}\t{d}\t{d}\n", .{
+        s.device, s.name, if (s.assist) "yes" else "no", if (s.pinned) "kept" else "auto", s.streams, s.active, s.waiting,
+    });
+}
+
+fn findLocalSession(app: *App, sessions: []const LocalSession, query: []const u8, assist: bool) !?LocalSession {
+    var match: ?LocalSession = null;
+    // Exact ids take precedence over names, as with device resolution.
+    for (sessions) |s| {
+        if ((!assist or s.status.assist) and eql(query, s.status.device)) {
+            if (match != null) {
+                _ = usage(app, "session is ambiguous; use --assist or session list", .{});
+                return error.ReportedUsage;
+            }
+            match = s;
+        }
+    }
+    if (match == null and !assist) for (sessions) |s| {
+        if (s.status.name.len != 0 and std.ascii.eqlIgnoreCase(query, s.status.name)) {
+            if (match != null) {
+                _ = usage(app, "session name is ambiguous; use an id", .{});
+                return error.ReportedUsage;
+            }
+            match = s;
+        }
+    };
+    return match;
+}
+
+fn keepSession(app: *App, sock: []const u8) !Exit {
+    const reply = (try sessionRequest(app, sock, "KEEPALIVE")) orelse
+        return app.fail(.connect, "the shared session ended before it could be kept", .{});
+    const status = std.json.parseFromSliceLeaky(mux.Status, app.arena, reply, .{}) catch
+        return app.fail(.connect, "the shared session cannot be managed; stop the old background process and retry", .{});
+    if (!status.pinned) return app.fail(.connect, "the shared session was not kept", .{});
+    try app.err.print("Keeping session for {s}\n", .{status.device});
+    return .ok;
+}
+
+fn cmdSession(app: *App, args: []const [:0]const u8) !Exit {
+    if (args.len == 0) return usage(app, "expected session start|list|status|stop", .{});
+    const action = args[0];
+    const list = eql(action, "list") or eql(action, "ls");
+    const start = eql(action, "start");
+    const stop = eql(action, "stop");
+    if (!list and !start and !stop and !eql(action, "status")) return usage(app, "unknown session command {s}", .{action});
+    var query: ?[]const u8 = null;
+    var json = false;
+    var force = false;
+    var assist = false;
+    for (args[1..]) |a| {
+        if (isFlag(a, "--json", "-j")) json = true else if (isFlag(a, "--force", "-f")) force = true else if (eql(a, "--assist")) assist = true else if (a.len > 0 and a[0] == '-') return usage(app, "unknown option {s}", .{a}) else if (query == null) query = a else return usage(app, "unexpected argument {s}", .{a});
+    }
+    if ((list and (query != null or assist)) or (!list and query == null) or
+        (force and !stop) or (json and (start or stop)))
+        return usage(app, "expected session start DEVICE | list [-j] | status DEVICE [-j] | stop DEVICE [-f]", .{});
+    const cfg_path = try app.configPath();
+    const sessions = try localSessions(app, cfg_path);
+    const existing = if (list) null else try findLocalSession(app, sessions, query.?, assist);
+    if (start) {
+        if (existing) |s| return keepSession(app, s.sock);
+        var cfg: config.Config = undefined;
+        var client: api.Client = undefined;
+        try signedInClient(app, &client, &cfg);
+        defer client.deinit();
+        const target = try resolveTarget(app, &client, &cfg, .{ .query = query.?, .assist = assist }, true);
+        const dev = sharedDevice(target);
+        var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch
+            return app.fail(.other, "the config path is too long for a shared session", .{});
+        if (try startMuxServer(app, cfg_path, dev, sock, target.assist_code)) |code| return code;
+        return keepSession(app, sock);
+    }
+    if (list) {
+        if (json) {
+            var statuses: std.ArrayList(SessionInfo) = .empty;
+            for (sessions) |s| try statuses.append(app.arena, .from(s.status));
+            try std.json.Stringify.value(statuses.items, .{}, app.out);
+            try app.out.writeByte('\n');
+        } else {
+            try app.out.writeAll("DEVICE\tNAME\tASSIST\tMODE\tSTREAMS\tACTIVE\tWAITING\n");
+            for (sessions) |s| try printSession(app, s.status);
+        }
+        return .ok;
+    }
+    const selected = existing orelse {
+        if (stop) return .ok;
+        return app.fail(.no_device, "no local session for {s}", .{query.?});
+    };
+    if (!stop) {
+        if (json) {
+            try std.json.Stringify.value(SessionInfo.from(selected.status), .{}, app.out);
+            try app.out.writeByte('\n');
+        } else {
+            try app.out.writeAll("DEVICE\tNAME\tASSIST\tMODE\tSTREAMS\tACTIVE\tWAITING\n");
+            try printSession(app, selected.status);
+        }
+        return .ok;
+    }
+    const reply = (try sessionRequest(app, selected.sock, if (force) "STOP FORCE" else "STOP")) orelse return .ok;
+    if (eql(reply, "ERR busy")) return app.fail(.remote, "session is in use; use --force to interrupt its users", .{});
+    if (!eql(reply, "OK")) return app.fail(.connect, "the shared session did not accept the stop request", .{});
+    // Wait until teardown removes the listener, so a subsequent start cannot reuse it.
+    for (0..100) |_| {
+        const conn = (try Io.net.UnixAddress.init(selected.sock)).connect(app.io) catch |err| switch (err) {
+            error.FileNotFound, error.ConnectionRefused => {
+                try app.err.print("Stopped session for {s}\n", .{selected.status.device});
+                return .ok;
+            },
+            else => return err,
+        };
+        conn.close(app.io);
+        try app.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return app.fail(.connect, "the shared session is still stopping", .{});
+}
+
 // --- shared proxy session (spec §7.2) -----------------------------------------------------------
 
 /// Unix sockets exist, and `UUCLI_MUX` is not 0/false/no/off.
@@ -704,7 +886,7 @@ fn muxEnabled(app: *App) bool {
 
 /// `proxy` through the shared session of DEVICE, starting it when needed. Null: not possible here
 /// (socket path too long), connect directly instead.
-fn proxyViaMux(app: *App, dev: DeviceArg, host: []const u8, port: u16) !?Exit {
+fn proxyViaMux(app: *App, dev: DeviceArg, assist_code: ?[]const u8, host: []const u8, port: u16) !?Exit {
     const cfg_path = try app.configPath();
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch {
@@ -719,7 +901,7 @@ fn proxyViaMux(app: *App, dev: DeviceArg, host: []const u8, port: u16) !?Exit {
             return .ok;
         },
         .refused => |reply| return muxRefused(app, reply),
-        .gone => if (try startMuxServer(app, cfg_path, dev, sock, null)) |code| return code,
+        .gone => if (try startMuxServer(app, cfg_path, dev, sock, assist_code)) |code| return code,
     };
     return app.fail(.connect, "the shared session did not take the connection", .{});
 }
@@ -971,9 +1153,10 @@ fn startMuxServer(app: *App, cfg_path: []const u8, dev: DeviceArg, sock: []const
     if (dev.assist) try argv.append(app.arena, "--assist");
     try argv.append(app.arena, dev.query);
     var env: ?std.process.Environ.Map = null;
-    if (code) |c| {
+    if (code != null or dev.name.len != 0) {
         env = try app.env.clone(app.arena);
-        try env.?.put("UUCLI_ASSIST_CODE", c);
+        if (code) |c| try env.?.put("UUCLI_ASSIST_CODE", c);
+        if (dev.name.len != 0) try env.?.put("UUCLI_MUX_NAME", dev.name);
     }
     var child = std.process.spawn(io, .{
         .argv = argv.items,
@@ -1007,8 +1190,8 @@ fn startMuxServer(app: *App, cfg_path: []const u8, dev: DeviceArg, sock: []const
 
 /// Internal (`uucli __mux [--assist] DEVICE`): one port mapping session for every `proxy` of
 /// DEVICE (spec §7.2). Prints `ready` on stdout once clients can connect; messages go to stderr
-/// (the mux log file). Ends after `UUCLI_MUX_IDLE` seconds (default 60) without streams, when the
-/// session ends, or on SIGINT/SIGTERM.
+/// (the mux log file). Automatic connections expire after `UUCLI_MUX_IDLE` seconds (default 60)
+/// without streams or leases; kept connections skip idle expiry. All end on loss or SIGINT/SIGTERM.
 fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
     const io = app.io;
     const assist = all_args.len != 0 and eql(all_args[0], "--assist");
@@ -1057,6 +1240,17 @@ fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
     } else s.publisher_platform orelse 0;
     var leases: lease.Server = .{ .io = io, .gpa = app.gpa, .link = s.link(), .platform = platform, .pm = &pm };
     pm.lease_hook = leases.hook();
+    var control: mux.Control = .{
+        .io = io,
+        .pm = &pm,
+        .leases = &leases,
+        .bus = &bus,
+        .device = target.id,
+        .name = app.env.get("UUCLI_MUX_NAME") orelse target.name,
+        .assist = dev.assist,
+        .config_scope = mux.scope(cfg_path),
+    };
+    pm.management_hook = control.hook();
 
     const cwd = Io.Dir.cwd();
     cwd.deleteFile(io, sock) catch |err| switch (err) {
@@ -1070,7 +1264,7 @@ fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
     defer pm.stopAccepting();
     // First, so that no new client reaches a server that is going away.
     defer cwd.deleteFile(io, sock) catch {};
-    var idle_task = try io.concurrent(muxIdleWatch, .{ io, &pm, &leases, &bus, idle });
+    var idle_task = try io.concurrent(muxIdleWatch, .{ &control, idle });
     defer idle_task.cancel(io) catch {};
 
     app.out.writeAll("ready\n") catch {};
@@ -1085,18 +1279,11 @@ fn cmdMuxServe(app: *App, all_args: []const [:0]const u8) !Exit {
 }
 
 /// Stops the session once no stream was open for `idle`.
-fn muxIdleWatch(io: Io, pm: *portmap.PortMap, leases: *lease.Server, bus: *session.Bus, idle: Io.Duration) Io.Cancelable!void {
-    var since = Io.Clock.awake.now(io);
+fn muxIdleWatch(control: *mux.Control, idle: Io.Duration) Io.Cancelable!void {
+    var since = Io.Clock.awake.now(control.io);
     while (true) {
-        try io.sleep(.fromSeconds(1), .awake);
-        const now = Io.Clock.awake.now(io);
-        if (pm.rules[0].streams.load(.monotonic) != 0 or leases.clients.load(.monotonic) != 0) {
-            since = now;
-        } else if (now.compare(.gt, since.addDuration(idle))) {
-            log.info("no streams for {d} s, closing the shared session", .{@divTrunc(idle.nanoseconds, std.time.ns_per_s)});
-            bus.put(.stop);
-            return;
-        }
+        try control.io.sleep(.fromSeconds(1), .awake);
+        if (control.expire(&since, idle)) return;
     }
 }
 
@@ -1107,6 +1294,7 @@ const DeviceArg = struct {
     assist: bool = false,
     /// `--no-mux`: open a session of its own instead of using the shared one (spec §7.2, §7.3).
     own_session: bool = false,
+    name: []const u8 = "",
 };
 
 /// Where a session goes: an account device, or a remote-assistance host (share id and code).
@@ -1115,7 +1303,12 @@ const Target = struct {
     assist_code: ?[]const u8 = null,
     /// Set for account devices.
     device: ?api.Device = null,
+    name: []const u8 = "",
 };
+
+fn sharedDevice(target: Target) DeviceArg {
+    return .{ .query = target.id, .assist = target.assist_code != null, .name = target.name };
+}
 
 /// DEVICE → target (spec §3.3); exit 2 when ambiguous, 4 when unknown or offline. `stdin_free`:
 /// the tool does not read stdin, so a code may be read from it when it is not a terminal.
@@ -1128,7 +1321,7 @@ fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, dev:
                 _ = app.fail(.no_device, "device {s} ({s}) is offline", .{ d.name, d.id });
                 return error.ReportedNoDevice;
             }
-            return .{ .id = d.id, .device = d };
+            return .{ .id = d.id, .device = d, .name = d.name };
         },
         .not_found => {},
         .ambiguous => |list| {
@@ -1139,7 +1332,7 @@ fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, dev:
     }
     const saved = try fetchSaved(app, client, .favorites);
     switch (try api.resolveSaved(app.arena, saved, dev.query)) {
-        .found => |f| return .{ .id = f.id, .assist_code = try assistCode(app, cfg, f.id, stdin_free) },
+        .found => |f| return .{ .id = f.id, .assist_code = try assistCode(app, cfg, f.id, stdin_free), .name = f.name },
         .not_found => {
             _ = app.fail(.no_device, "no device {s}: see `uucli device list` and `uucli fav list`", .{dev.query});
             return error.ReportedNoDevice;
@@ -1511,7 +1704,7 @@ fn runToolSession(
         cfg.assistCode(target.id) == null and
         (if (app.env.get("UUCLI_ASSIST_CODE")) |code| code.len == 0 else true);
     if (!dev.own_session and muxEnabled(app))
-        if (try runLeased(app, dev, target, save_code, Tool, tool_state, worker)) |code| return code;
+        if (try runLeased(app, sharedDevice(target), target, save_code, Tool, tool_state, worker)) |code| return code;
     var code_retries: u8 = 0;
     const s = while (true) {
         const opened = session.Session.open(.{
@@ -2104,4 +2297,117 @@ test "assistance code retries require a rejected join and interactive input" {
     try t.expect(!retryAssistCode(error.ConnectFailed, .{ .status = 500, .code = 1131 }, true, true, 0));
     try t.expect(!retryAssistCode(error.ConnectFailed, .{ .status = 400, .code = 2002 }, true, true, 0));
     try t.expect(!retryAssistCode(error.ConnectFailed, .{}, true, true, 0));
+}
+
+test "session commands use live local status, isolate configs and ignore stale sockets" {
+    const t = std.testing;
+    const io = t.io;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const cfg_path = try std.fs.path.join(a, &.{ base, "config.json" });
+    const mux_dir = try std.fs.path.join(a, &.{ base, "mux" });
+    try Io.Dir.cwd().createDirPath(io, mux_dir);
+    const sock = try std.fs.path.join(a, &.{ mux_dir, "live.sock" });
+    const other_sock = try std.fs.path.join(a, &.{ mux_dir, "other.sock" });
+    const stale = try Io.Dir.cwd().createFile(io, try std.fs.path.join(a, &.{ mux_dir, "stale.sock" }), .{});
+    stale.close(io);
+    var server = try (try Io.net.UnixAddress.init(sock)).listen(io, .{});
+    defer server.deinit(io);
+    var dead = try (try Io.net.UnixAddress.init(try std.fs.path.join(a, &.{ mux_dir, "dead.sock" }))).listen(io, .{});
+    dead.deinit(io);
+    var other = try (try Io.net.UnixAddress.init(other_sock)).listen(io, .{});
+    defer other.deinit(io);
+    const Fake = struct {
+        fn serve(srv: *Io.net.Server, socket: []const u8, config_scope: u64) Io.Cancelable!void {
+            while (true) {
+                const conn = srv.accept(t.io) catch |e| switch (e) {
+                    error.Canceled => return error.Canceled,
+                    else => return,
+                };
+                defer conn.close(t.io);
+                var line: [128]u8 = undefined;
+                const request = portmap.PortMap.readLineTimed(t.io, conn, &line) catch continue;
+                var wb: [1024]u8 = undefined;
+                var w = conn.writer(t.io, &wb);
+                if (eql(request, "STOP")) {
+                    w.interface.writeAll("ERR busy\n") catch continue;
+                } else if (eql(request, "STOP FORCE")) {
+                    Io.Dir.cwd().deleteFile(t.io, socket) catch {};
+                    w.interface.writeAll("OK\n") catch return;
+                    w.interface.flush() catch {};
+                    return;
+                } else {
+                    const status: mux.Status = .{
+                        .device = "host-1",
+                        .name = "office-pc",
+                        .assist = false,
+                        .scope = config_scope,
+                        .pinned = true,
+                        .streams = 2,
+                        .active = 1,
+                        .waiting = 3,
+                    };
+                    std.json.Stringify.value(status, .{}, &w.interface) catch continue;
+                    w.interface.writeByte('\n') catch continue;
+                }
+                w.interface.flush() catch {};
+            }
+        }
+    };
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fake.serve, .{ &server, sock, mux.scope(cfg_path) });
+    try group.concurrent(io, Fake.serve, .{ &other, other_sock, mux.scope("other-config.json") });
+    var env: std.process.Environ.Map = .init(t.allocator);
+    defer env.deinit();
+    try env.put("UUCLI_CONFIG", cfg_path);
+    try env.put("UUCLI_MUX", "0");
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(t.allocator);
+    defer err.deinit();
+    var app: App = .{ .io = io, .gpa = t.allocator, .arena = a, .env = &env, .out = &out.writer, .err = &err.writer };
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "list", "-j" }));
+    const statuses = try std.json.parseFromSliceLeaky([]SessionInfo, a, out.written(), .{});
+    try t.expectEqual(@as(usize, 1), statuses.len);
+    try t.expectEqualStrings("host-1", statuses[0].device);
+    out.clearRetainingCapacity();
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "status", "OFFICE-PC", "-j" }));
+    const status = try std.json.parseFromSliceLeaky(SessionInfo, a, out.written(), .{});
+    try t.expectEqual(@as(u32, 2), status.streams);
+    try t.expectEqual(@as(u32, 3), status.waiting);
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "start", "office-pc" }));
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "start", "host-1" }));
+    try t.expectEqual(Exit.no_device, run(&app, &.{ "session", "status", "missing" }));
+    try t.expectEqual(Exit.remote, run(&app, &.{ "session", "stop", "host-1" }));
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "stop", "host-1", "--force" }));
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "stop", "host-1" }));
+    out.clearRetainingCapacity();
+    try t.expectEqual(Exit.ok, run(&app, &.{ "session", "ls", "-j" }));
+    try t.expectEqualStrings("[]\n", out.written());
+    for ([_][]const [:0]const u8{
+        &.{"session"},                                  &.{ "session", "list", "device" },        &.{ "session", "start" },
+        &.{ "session", "status", "host-1", "--force" }, &.{ "session", "start", "host-1", "-j" },
+    }) |args| try t.expectEqual(Exit.usage, run(&app, args));
+}
+
+test "shared connection identity uses resolved ids and assistance mode" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const devices = [_]api.Device{.{ .id = "host-1", .name = "office-pc", .platform = .windows, .online = true, .shared = false }};
+    var first: [256]u8 = undefined;
+    var second: [256]u8 = undefined;
+    for ([_][]const u8{ "office-pc", "OFFICE-PC", "host-1" }) |query| {
+        const resolved = try api.resolveDevice(arena.allocator(), &devices, query);
+        const d = resolved.found;
+        const dev = sharedDevice(.{ .id = d.id, .name = d.name, .device = d });
+        try t.expectEqualStrings(try mux.path(&first, "config.json", false, "host-1", .sock), try mux.path(&second, "config.json", dev.assist, dev.query, .sock));
+    }
+    const favorite = sharedDevice(.{ .id = "123456789", .name = "office-pc", .assist_code = "test-code" });
+    try t.expectEqualStrings(try mux.path(&first, "config.json", true, "123456789", .sock), try mux.path(&second, "config.json", favorite.assist, favorite.query, .sock));
 }

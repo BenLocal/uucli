@@ -60,6 +60,12 @@ pub const Server = struct {
         queue: Io.Queue(Msg) = undefined,
     };
 
+    pub fn hasHolder(s: *Server) bool {
+        s.mutex.lockUncancelable(s.io);
+        defer s.mutex.unlock(s.io);
+        return s.holder != null;
+    }
+
     pub fn hook(s: *Server) portmap.RequestHook {
         return .{ .ptr = s, .serveFn = serveErased };
     }

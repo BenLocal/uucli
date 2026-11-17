@@ -18,8 +18,10 @@
          tools/portmap.zig · tools/terminal.zig · tools/files.zig
 ```
 
-- 单进程、单个 `std.Io` 实例；每次命令建立一个会话，用完退出（`portmap` 除外，它常驻并自动重连）。
+- Each process owns one `std.Io` instance. A background `__mux` process holds the shared connection; port streams run in parallel and terminal / exec / files clients take serial leases. `session start` keeps it open; automatic connections expire when idle (spec §7.2–§7.4).
 - 依赖方向：`main` → `tools/*` → `session` → `api` / `rtc` / `signal` / `wire`；`tools/*` 只依赖 `session` 和 `wire`，彼此互不依赖；`login` → `api` → `config`；`signal` → `ws`。没有反向依赖，`rtc`、`wire`、`ws`、`config` 不依赖任何项目模块。
+
+- Local management follows `main` → `mux` → `lease` / `tools/portmap` / `session`. `mux.Control` owns the keep flag and management requests; transport setup remains in `session`.
 
 ## 模块边界
 
@@ -27,6 +29,7 @@
 | --- | --- | --- |
 | `main.zig` | 参数解析、简写、设备解析、退出码映射 | 不碰协议细节 |
 | `config.zig` / `login.zig` / `api.zig` | 配置文件（权限、锁）、设备注册与扫码登录、REST 签名与错误码映射 | 不碰 WebRTC |
+| `mux.zig` / `lease.zig` | Local socket identity, connection management, keep / idle state, and serial tool leases | No remote business protocol encoding |
 | `session.zig` | 加入房间 → 信令 → WebRTC → echo → ready；把消息路由给工具 | 不理解工具的业务帧 |
 | `rtc.zig` | libdatachannel 绑定，回调里只复制数据推进队列 | 其他模块都不直接碰 libdatachannel |
 | `wire.zig` | protobuf 编解码、envelope、echo、connect options | 无 I/O |

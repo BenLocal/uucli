@@ -91,6 +91,12 @@ pub const RequestHook = struct {
     serveFn: *const fn (ptr: *anyopaque, conn: net.Stream) Io.Cancelable!void,
 };
 
+/// Serves a local management request; owns `conn` and does not take a lease.
+pub const ManagementHook = struct {
+    ptr: *anyopaque,
+    serveFn: *const fn (ptr: *anyopaque, conn: net.Stream, request: []const u8) void,
+};
+
 /// Longest `HOST PORT` request line of a shared-session client, newline included.
 pub const max_mux_request = 300;
 const mux_request_timeout: Io.Duration = .fromSeconds(10);
@@ -150,6 +156,7 @@ pub const PortMap = struct {
     last_error: ?anyerror = null,
     /// Shared session: takes `LEASE` requests.
     lease_hook: ?RequestHook = null,
+    management_hook: ?ManagementHook = null,
 
     pub fn init(io: Io, gpa: Allocator, rules: []const Rule) !PortMap {
         const states = try gpa.alloc(RuleState, rules.len);
@@ -269,6 +276,9 @@ pub const PortMap = struct {
             return;
         };
         if (std.mem.eql(u8, line, "LEASE")) if (pm.lease_hook) |h| return h.serveFn(h.ptr, conn);
+        if (std.mem.eql(u8, line, "STATUS") or std.mem.eql(u8, line, "KEEPALIVE") or
+            std.mem.eql(u8, line, "STOP") or std.mem.eql(u8, line, "STOP FORCE"))
+            if (pm.management_hook) |h| return h.serveFn(h.ptr, conn, line);
         const req = parseMuxRequest(line) catch {
             muxReply(io, conn, "ERR request\n");
             conn.close(io);
@@ -286,7 +296,7 @@ pub const PortMap = struct {
         };
     }
 
-    fn readLineTimed(io: Io, conn: net.Stream, buf: []u8) ![]const u8 {
+    pub fn readLineTimed(io: Io, conn: net.Stream, buf: []u8) ![]const u8 {
         const U = union(enum) { line: anyerror![]const u8, timeout: Io.Cancelable!void };
         var sel_buf: [2]U = undefined;
         var sel: Io.Select(U) = .init(io, &sel_buf);
