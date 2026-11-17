@@ -84,7 +84,7 @@ is a share id, joined by code.
 | `uucli fav add ID [NAME] [--save-code]` | — | Adds share `ID` to the favorites with remark `NAME` (§5.5). `--save-code` also stores its code in the config (§5.6). Adding an existing favorite again replaces its remark (verified 2026-11-16), so this also renames. |
 | `uucli fav edit NAME\|ID [NEW_NAME] [--save-code]` | — | Changes a favorite (resolved like §3.3 step 4; exit 4 when absent): `NEW_NAME` re-adds it with that remark and its original `favorited_at`; `--save-code` replaces the code in the config. At least one of the two, else exit 2. |
 | `uucli fav rm\|remove NAME\|ID` | — | Removes a favorite (resolved like §3.3 step 4; exit 4 when absent) and its saved code. |
-| `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
+| `uucli portmap DEVICE -L [BIND:]LPORT:HOST:PORT [-L ...] [--no-reconnect] [--no-mux]` | M2 | Forwards local TCP ports to `HOST:PORT` as seen from the controlled host. `BIND` defaults to `127.0.0.1`. `LPORT` 0 picks a free port; the chosen ports are printed on stderr as `Listening on BIND:PORT -> HOST:PORT`. Runs until SIGINT/SIGTERM. |
 | `uucli proxy [--no-mux] DEVICE HOST PORT` | M2 | Opens one forwarded stream and connects it to stdin/stdout, for `ProxyCommand`. By default the stream goes through the shared session of DEVICE (§7.2); `--no-mux` opens a session of its own. Exits when the stream ends. |
 | `uucli terminal DEVICE [SESSION] [-e CHAR\|none]` | M3 | Attaches the current tty to a remote PTY (§11.1). |
 | `uucli terminal DEVICE --list [--json]` | M3 | Lists remote terminal sessions. |
@@ -576,11 +576,11 @@ Default on for `portmap`, off for `proxy`.
   same code, which fails once the host withdraws the share.
 - `--no-reconnect`: exit with code 5 when the session ends.
 
-### 7.2 Shared `proxy` session
+### 7.2 Shared session for `proxy` and `portmap`
 
 A host keeps one controller session at a time: a second session to it ends the first one
 (`leave` → `released`), and two joining at once can end the later one (`RoomClosed`). So every
-`proxy` of one DEVICE shares one session, held by a background `uucli __mux [--assist] DEVICE`
+`proxy` of one DEVICE, and every connection accepted by `portmap`, shares one session, held by a background `uucli __mux [--assist] DEVICE`
 process (internal command; not a stable interface).
 
 - Files in `CONFIG_DIR/mux/` (mode 0700), named `HASH.sock`, `HASH.lock`, `HASH.log` (0600). HASH
@@ -599,6 +599,12 @@ process (internal command; not a stable interface).
   `ERR rejected` (exit 6), `ERR timeout` (exit 5), `ERR request` / `ERR failed` (exit 5). The
   request must arrive within 10 s. End of stdin half-closes the socket; `proxy` exits 0 when the
   socket ends.
+- `portmap` resolves DEVICE (asking for an assistance code on a terminal as before), binds its
+  listeners, and then opens no session itself: each accepted connection runs the client side above,
+  starting the server when needed, and is closed when that fails (logged as a warning). A code it
+  asked for is passed to the server as `UUCLI_ASSIST_CODE`. Reconnecting is therefore per
+  connection: after the server exits, the next accepted connection starts a new one.
+  `--no-reconnect` keeps the own-session behavior of §7.1 (it must fail when the session ends).
 - The server opens the session like `portmap` (capture type 9) but does not reconnect: when the
   session ends it removes the socket file and exits, closing its streams; the next `proxy` starts
   a new one. It also ends after `UUCLI_MUX_IDLE` seconds (default 60) without streams, and on
@@ -606,8 +612,10 @@ process (internal command; not a stable interface).
 - An assistance code comes from `UUCLI_ASSIST_CODE` (inherited) or the config; the server never
   prompts.
 - Off with `--no-mux` or `UUCLI_MUX=0` (also `false`, `no`, `off`), and when the socket path would
-  exceed 103 bytes; then `proxy` behaves as before. `terminal`, `exec`, `files` and `portmap`
-  still open sessions of their own and compete with the shared one.
+  exceed 103 bytes; then `proxy` and `portmap` behave as before (§7, §7.1). `terminal`, `exec` and
+  `files` still open sessions of their own and compete with the shared one. Tried on the official
+  Windows host (2026-11-17): a capture type 9 session also serves terminal open/list, `exec` and
+  `files ls`, so they could share it too; not implemented yet.
 
 ## 8. Concurrency model
 

@@ -126,10 +126,10 @@ ssh -o 'ProxyCommand=uucli proxy office-pc 127.0.0.1 22' me@office-pc
 `proxy` carries the byte stream on stdin/stdout, so leave those streams connected
 to SSH. The remote SSH service and its authentication must already be available.
 
-A host serves one connection at a time. All `proxy` commands for the same DEVICE share one
-background connection, so several SSH sessions (also to different machines behind that host) can
-run in parallel. A `terminal`, `exec`, `files` or `portmap` on the same host takes the connection
-over and ends running `proxy` streams; avoid running them alongside.
+A host serves one connection at a time. All `proxy` commands and `portmap` connections for the
+same DEVICE share one background connection, so several SSH sessions (also to different machines
+behind that host) can run in parallel. A `terminal`, `exec` or `files` on the same host takes the
+connection over and ends running `proxy` / `portmap` streams; avoid running them alongside.
 
 ## Use remote assistance and favorites
 
