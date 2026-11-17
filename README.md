@@ -30,6 +30,13 @@ version message.
 `zig build release` builds Linux x86_64/aarch64 (static musl) and macOS x86_64/aarch64; the macOS
 archives need a macOS host with the SDK installed.
 
+## Agent skill
+
+The [uucli skill](skills/uucli/SKILL.md) provides agent workflows for login, remote commands,
+files, tunnels, and remote assistance. Install the `skills/uucli` directory in your agent's
+skill directory, or link it there from this checkout. The skill uses `uucli` from PATH and
+also supports the checkout's `zig-out/bin/uucli`.
+
 ## Sign in
 
 ```sh

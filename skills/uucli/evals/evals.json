@@ -1,0 +1,23 @@
+{
+  "skill_name": "uucli",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Use uucli to check the Windows host office-pc hostname and SSH service. Return structured results.",
+      "expected_output": "Discover the target ID, use exec --json with a finite timeout and PowerShell syntax, quote remote commands, and distinguish remote status from connection errors.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Download report.txt from C:\\Users\\Public\\Downloads on office-pc. The local report.txt already exists.",
+      "expected_output": "Use files get with the remote Windows path quoted. Resolve the destination conflict without silently overwriting; verify the completed file.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "SSH through UU remote assistance share 123456789. The assistance code is already in UUCLI_ASSIST_CODE. Stop the temporary tunnel afterward.",
+      "expected_output": "Use proxy --assist with SSH or a managed portmap --assist process; keep secrets out of arguments and output, preserve the proxy byte stream, and clean up a listener if created.",
+      "files": []
+    }
+  ]
+}

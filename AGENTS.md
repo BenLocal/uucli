@@ -51,7 +51,7 @@
 
 ## 📇 项目 Skill 索引（全仓 SKILL.md，脚本生成）
 <!-- SKILLS:START -->
-- （仓库内暂无 SKILL.md）
+- **uucli** — Operate NetEase UU Remote hosts with uucli for device discovery, remote shell commands, terminal ses… （`skills/uucli`）
 <!-- SKILLS:END -->
 
 ## 📂 模块文档索引（docs/agents-dot-md/，脚本生成）
