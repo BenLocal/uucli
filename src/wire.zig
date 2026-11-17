@@ -470,3 +470,62 @@ pub fn answerSdp(gpa: Allocator, body: std.json.Value) error{ InvalidAnswer, Out
     }
     return out;
 }
+
+test "decoder rejects malformed fields without exposing partial values" {
+    const cases = [_]struct { data: []const u8, err: DecodeError }{
+        .{ .data = &.{0x80}, .err = error.Truncated },
+        .{ .data = &.{ 0x08, 0x80 }, .err = error.Truncated },
+        .{ .data = &.{ 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02 }, .err = error.VarintOverflow },
+        .{ .data = &.{0}, .err = error.InvalidField },
+        .{ .data = &.{ 0x80, 0x80, 0x80, 0x80, 0x10 }, .err = error.InvalidField },
+        .{ .data = &.{0x0b}, .err = error.UnsupportedWireType },
+        .{ .data = &.{0x0c}, .err = error.UnsupportedWireType },
+        .{ .data = &.{0x0e}, .err = error.UnsupportedWireType },
+        .{ .data = &.{0x0f}, .err = error.UnsupportedWireType },
+        .{ .data = &.{ 0x09, 1, 2, 3 }, .err = error.Truncated },
+        .{ .data = &.{ 0x0d, 1, 2, 3 }, .err = error.Truncated },
+        .{ .data = &.{ 0x12, 3, 'a' }, .err = error.Truncated },
+        .{ .data = &.{ 0x12, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1 }, .err = error.Truncated },
+    };
+    for (cases) |case| {
+        var it: Iterator = .init(case.data);
+        try testing.expectError(case.err, it.next());
+        var b: Builder = .init(testing.allocator);
+        defer b.deinit();
+        try b.int(1, 42);
+        try b.bytes(2, "ok");
+        try b.buf.appendSlice(testing.allocator, case.data);
+        try testing.expect(!valid(b.buf.items));
+        try testing.expectEqual(@as(u64, 0), uint(b.buf.items, 1));
+        try testing.expect(blob(b.buf.items, 2) == null);
+        try testing.expect(!hasField(b.buf.items, &.{ 1, 2 }));
+    }
+}
+
+test "decoder accepts fixed fields and skips them during lookup" {
+    const data = &[_]u8{ 0x09, 1, 2, 3, 4, 5, 6, 7, 8, 0x15, 9, 10, 11, 12, 0x18, 42, 0x22, 0 };
+    var it: Iterator = .init(data);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &(try it.next()).?.value.fixed64);
+    try testing.expectEqualSlices(u8, &.{ 9, 10, 11, 12 }, &(try it.next()).?.value.fixed32);
+    try testing.expect(valid(data));
+    try testing.expectEqual(@as(u64, 42), uint(data, 3));
+    try testing.expectEqualStrings("", blob(data, 4).?);
+    try testing.expect(hasField(data, &.{2}));
+    try testing.expect(!hasField(data, &.{5}));
+}
+
+test "answer SDP enforces the plain size limit" {
+    const gpa = testing.allocator;
+    const sdp = try gpa.alloc(u8, 1024 * 1024 + 1);
+    defer gpa.free(sdp);
+    @memset(sdp, 'a');
+    var body: std.json.Value = .{ .object = .empty };
+    defer body.object.deinit(gpa);
+    try body.object.put(gpa, "sdp", .{ .string = sdp[0 .. sdp.len - 1] });
+    const accepted = try answerSdp(gpa, body);
+    defer gpa.free(accepted);
+    try testing.expectEqualStrings(sdp[0 .. sdp.len - 1], accepted);
+    try body.object.put(gpa, "sdp", .{ .string = sdp });
+    try testing.expectError(error.InvalidAnswer, answerSdp(gpa, body));
+    try testing.expectError(error.InvalidAnswer, answerSdp(gpa, .null));
+}

@@ -435,3 +435,14 @@ test "parseRule" {
 test {
     std.testing.refAllDecls(PortMap);
 }
+
+test "parseRule port boundaries and malformed brackets" {
+    const ephemeral = try parseRule("0:host:65535");
+    try testing.expectEqual(@as(u16, 0), ephemeral.lport);
+    try testing.expectEqual(@as(u16, 65535), ephemeral.port);
+    const maximum = try parseRule("65535:[::1]:1");
+    try testing.expectEqual(@as(u16, 65535), maximum.lport);
+    try testing.expectEqualStrings("::1", maximum.host);
+    for ([_][]const u8{ "", "65536:h:1", "-1:h:1", "1:h:-1", ":1:h:1", "1:[]:1", "1:   :1", "[::1]x:1:h:1", "1:[::1:80", "1:h:1:" }) |bad|
+        try testing.expectError(error.InvalidForward, parseRule(bad));
+}

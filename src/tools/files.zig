@@ -636,3 +636,10 @@ test "safeRelative, deflate/inflate" {
 test {
     std.testing.refAllDecls(Files);
 }
+
+test "safeRelative rejects traversal with either host separator" {
+    for ([_][]const u8{ ".", "./a", "a/./b", "a/..", "a\\..\\b", "a/..\\b", "\\\\server\\share", "d/a:stream" }) |path|
+        try testing.expect(!safeRelative(path));
+    for ([_][]const u8{ "dir\\a.bin", "dir/sub/file", "...", "a..b", "file name.bin" }) |path|
+        try testing.expect(safeRelative(path));
+}
