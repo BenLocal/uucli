@@ -145,7 +145,8 @@ Saved remote codes are encrypted with XChaCha20-Poly1305. The key lives beside t
 as `config.json.key` (or `UUCLI_CONFIG` plus `.key`), with mode 0600. Keep it private and
 back it up separately: losing it prevents reading saved codes, while access to both files
 allows decryption. Login tokens remain unencrypted. Old plaintext saved-code entries are
-not migrated; remove `assist_codes` from the old config and enter the codes again.
+not migrated: in a terminal uucli offers to remove them (`[y/N]`); otherwise remove
+`assist_codes` from the old config. Then enter the codes again.
 
 
 

@@ -164,8 +164,12 @@ mode 0600, created exclusively and synced before encrypted configuration is writ
 The key is created only when saving codes, never when loading encrypted data.
 Missing, malformed, or group/other-accessible keys and failed authentication cause a
 config load error (exit 1); no fallback to plaintext occurs. Configs without saved
-codes need no key. Existing plaintext entries are unsupported and are not migrated;
-remove the old `assist_codes` entries and enter the codes again.
+codes need no key. Existing plaintext entries are unsupported and are not migrated.
+When stdin and stderr are terminals, loading such a config asks
+`... Remove them? [y/N]`; `y`/`yes` removes the plaintext entries (encrypted ones stay), prints
+`Removed N saved remote code(s); enter them again when asked` on stderr and continues. Any other
+answer, or no terminal, is the load error (exit 1); remove the old `assist_codes` entries by hand
+and enter the codes again.
 
 The key must accompany the config when restoring encrypted codes. Copying the config
 alone does not expose the saved passwords. Anyone who can read both files can decrypt

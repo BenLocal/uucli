@@ -105,9 +105,38 @@ pub const App = struct {
         return null;
     }
 
+    /// On a terminal, asks whether to remove saved codes in an unsupported (older) format.
+    fn confirmDropCodes(app: *App, path: []const u8) bool {
+        if (!(Io.File.stdin().isTty(app.io) catch false) or !(Io.File.stderr().isTty(app.io) catch false)) return false;
+        app.err.print("Saved remote codes in {s} use an unsupported format (from an older uucli). Remove them? [y/N] ", .{path}) catch return false;
+        app.err.flush() catch return false;
+        // One byte at a time: nothing after the line is consumed.
+        var buf: [1]u8 = undefined;
+        var r = Io.File.stdin().readerStreaming(app.io, &buf);
+        var answer: [8]u8 = undefined;
+        var len: usize = 0;
+        while (r.interface.takeByte()) |b| {
+            if (b == '\n') break;
+            if (len < answer.len) answer[len] = b;
+            len += 1;
+        } else |_| return false;
+        if (len > answer.len) return false;
+        const a = std.mem.trim(u8, answer[0..len], " \t\r");
+        return std.ascii.eqlIgnoreCase(a, "y") or std.ascii.eqlIgnoreCase(a, "yes");
+    }
+
     /// Loads the config and maps load errors to messages.
     fn loadConfig(app: *App, path: []const u8) !config.Config {
         return config.load(app.arena, app.io, path) catch |err| {
+            if (err == error.UnsupportedCodeFormat and app.confirmDropCodes(path)) {
+                if (config.dropUnsupportedCodes(app.arena, app.io, path)) |n| {
+                    try app.err.print("Removed {d} saved remote code(s); enter them again when asked\n", .{n});
+                    return app.loadConfig(path);
+                } else |e| {
+                    _ = app.fail(.other, "cannot remove the saved remote codes from {s}: {t}", .{ path, e });
+                    return error.Reported;
+                }
+            }
             switch (err) {
                 error.InsecurePermissions => _ = app.fail(.other, "{s} is accessible by group/other; fix with: chmod 600 {s}", .{ path, path }),
                 error.InvalidConfig => _ = app.fail(.other, "{s} is not a valid uucli config", .{path}),

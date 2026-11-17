@@ -76,6 +76,30 @@ const max_size = 1 << 20;
 
 /// Reads the config; a missing file is an empty config.
 pub fn load(arena: Allocator, io: Io, path: []const u8) !Config {
+    var cfg = try loadStored(arena, io, path);
+    for (cfg.assist_codes) |entry| if (!std.mem.startsWith(u8, entry.code, code_prefix))
+        return error.UnsupportedCodeFormat;
+    try decryptCodes(arena, io, path, &cfg);
+    return cfg;
+}
+
+/// Removes saved codes that are not in the encrypted format (plaintext from older versions) and
+/// rewrites the config; encrypted codes are kept. Returns how many were removed.
+pub fn dropUnsupportedCodes(arena: Allocator, io: Io, path: []const u8) !usize {
+    var cfg = try loadStored(arena, io, path);
+    var kept: std.ArrayList(Config.AssistCode) = .empty;
+    for (cfg.assist_codes) |entry| if (std.mem.startsWith(u8, entry.code, code_prefix))
+        try kept.append(arena, entry);
+    const dropped = cfg.assist_codes.len - kept.items.len;
+    if (dropped == 0) return 0;
+    cfg.assist_codes = kept.items;
+    try decryptCodes(arena, io, path, &cfg);
+    try save(io, path, cfg);
+    return dropped;
+}
+
+/// The config as stored: saved codes still encrypted.
+fn loadStored(arena: Allocator, io: Io, path: []const u8) !Config {
     const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => |e| return e,
@@ -89,23 +113,22 @@ pub fn load(arena: Allocator, io: Io, path: []const u8) !Config {
         error.ReadFailed => return r.err.?,
         else => |e| return e,
     };
-    var cfg = std.json.parseFromSliceLeaky(Config, arena, bytes, .{
+    return std.json.parseFromSliceLeaky(Config, arena, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => return error.InvalidConfig,
     };
-    if (cfg.assist_codes.len != 0) {
-        for (cfg.assist_codes) |entry| if (!std.mem.startsWith(u8, entry.code, code_prefix))
-            return error.UnsupportedCodeFormat;
-        var key = try encryptionKey(io, path, false);
-        defer std.crypto.secureZero(u8, &key);
-        const codes = try arena.dupe(Config.AssistCode, cfg.assist_codes);
-        for (codes) |*entry| entry.code = try decryptCode(arena, key, entry.id, entry.code);
-        cfg.assist_codes = codes;
-    }
-    return cfg;
+}
+
+fn decryptCodes(arena: Allocator, io: Io, path: []const u8, cfg: *Config) !void {
+    if (cfg.assist_codes.len == 0) return;
+    var key = try encryptionKey(io, path, false);
+    defer std.crypto.secureZero(u8, &key);
+    const codes = try arena.dupe(Config.AssistCode, cfg.assist_codes);
+    for (codes) |*entry| entry.code = try decryptCode(arena, key, entry.id, entry.code);
+    cfg.assist_codes = codes;
 }
 
 /// Writes `PATH.tmp` (0600), syncs it and renames it over `path`. Creates the directory (0700).
@@ -412,6 +435,38 @@ test "encrypted assistance codes reject tampering wrong keys and swapped hosts" 
     for ([_][]const u8{ "enc:v1:!", "enc:v1:", "enc:v1:AAAA" }) |bad|
         try testing.expectError(error.CodeDecryptionFailed, decryptCode(gpa, key, "host-a", bad));
     try testing.expectError(error.UnsupportedCodeFormat, decryptCode(gpa, key, "host-a", "legacy-plain-code"));
+}
+
+test "plaintext saved codes are rejected and can be dropped, keeping encrypted ones" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "config.json");
+    var cfg: Config = .{ .device_id = "test-device" };
+    try cfg.setAssistCode(arena, "share-new", "new-test-code");
+    try save(io, path, cfg);
+    const stored = try loadStored(arena, io, path);
+    const mixed = try std.mem.concat(arena, Config.AssistCode, &.{ stored.assist_codes, &.{.{ .id = "share-old", .code = "old-plain-code" }} });
+    {
+        var legacy = stored;
+        legacy.assist_codes = mixed;
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        var buf: [256]u8 = undefined;
+        var w = file.writerStreaming(io, &buf);
+        try std.json.Stringify.value(legacy, .{}, &w.interface);
+        try w.interface.flush();
+    }
+    try testing.expectError(error.UnsupportedCodeFormat, load(arena, io, path));
+    try testing.expectEqual(@as(usize, 1), try dropUnsupportedCodes(arena, io, path));
+    const back = try load(arena, io, path);
+    try testing.expectEqualStrings("test-device", back.device_id);
+    try testing.expectEqualStrings("new-test-code", back.assistCode("share-new").?);
+    try testing.expect(back.assistCode("share-old") == null);
+    try testing.expectEqual(@as(usize, 0), try dropUnsupportedCodes(arena, io, path));
 }
 
 test "configs without assistance codes need no encryption key" {
