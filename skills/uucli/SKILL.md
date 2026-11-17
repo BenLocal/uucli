@@ -139,10 +139,18 @@ repository files. When stdin carries a terminal or proxy stream, use the
 environment, saved config, or an interactive code prompt rather than piping a code.
 
 `fav add --save-code` and `fav edit --save-code` persist the code in the private
-config. Save a code only when requested. Adding an existing favorite replaces its
+config. Use these commands when explicitly managing saved codes. Adding an existing favorite replaces its
 remark; removing a favorite also removes its saved code. A temporary assistance
 code may need replacement after use. A saved favorite can be used as an ordinary
 target without `--assist`.
+
+For interactive `terminal` and `exec`, a join rejected with API 1131 asks for a new
+code up to three times. This error may also mean assistance is disabled. A code
+entered interactively is saved after the connection succeeds, including a replacement
+for a stale saved code. Environment-only codes are not automatically saved.
+Non-interactive calls do not prompt again. Retry applies only to setup, before
+the remote command starts.
+
 
 ## Interpret failures
 

@@ -364,11 +364,21 @@ Retry: on API error codes other than `-1, 2002, 2006, 2007, 4042`, retry up to 5
 A remote-assistance host (§5.5) is joined by share id and code instead (upstream after the pin,
 `src/viewer/api.rs` `join_share`): `POST /api/v2/room/join/share/by_code`, body
 `{"connect_id": ID, "connect_code": CODE}`; when v2 answers HTTP 404 or 405, the same request to
-`/api/v1/room/join/share/by_code`. Same response as above. No retry. A wrong or expired code, or a
+`/api/v1/room/join/share/by_code`. Same response as above. A wrong or expired code, or a
 host that turned assistance off → HTTP 400 code 1131 → exit 5; the server message is shown unless it
 contains the code. Same-account devices cannot assist each other (server message). The join answer's
 `publisher_platform` picks the `exec` shell (§11.1.1), since the host is not in the device list.
 Assistance sessions skip the device-list check before a `portmap` reconnect (§7.1).
+
+For `terminal` and `exec`, an assistance join rejected with HTTP 400 / API 1131 prompts
+for a replacement code when stdin is a terminal, up to three replacements. The prompt also
+explains that assistance may be disabled. Other failures and non-interactive calls do not
+retry. Each replacement bypasses the environment and saved code. After a session reaches
+ready, a code entered interactively (initial or replacement) is saved by share id under
+the config lock with mode 0600. Environment-only codes are not automatically saved.
+A failed connection leaves the saved code unchanged. Only session setup is retried,
+before any terminal operation or remote command runs.
+
 
 ### 6.2 Signaling (Socket.IO over WebSocket)
 

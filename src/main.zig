@@ -64,6 +64,7 @@ const usage_text =
     \\DEVICE is a device id or name from `device list` or `fav list`. With --assist (portmap, proxy,
     \\terminal, exec, files), DEVICE is the share id of a host offering remote assistance. Its code
     \\comes from UUCLI_ASSIST_CODE, the config (fav add --save-code), or is asked for.
+    \\Interactive terminal/exec saves entered codes after connection and prompts again for rejected codes.
     \\
     \\Short forms:
     \\  dev = device, ls = list, pm = portmap, px = proxy, term = terminal, fs = files, x = exec
@@ -877,6 +878,12 @@ fn openFailure(app: *App, err: session.OpenError) Exit {
     };
 }
 
+/// Only rejected assistance joins may ask for a replacement; tool execution is never retried.
+fn retryAssistCode(err: session.OpenError, failure: api.Failure, assist: bool, interactive: bool, retries: u8) bool {
+    return err == error.ConnectFailed and failure.status == 400 and failure.code == 1131 and
+        assist and interactive and retries < 3;
+}
+
 /// One session for a tool that runs `worker` (on its own task) while this task routes messages.
 fn runToolSession(
     app: *App,
@@ -890,7 +897,7 @@ fn runToolSession(
     var client: api.Client = undefined;
     try signedInClient(app, &client, &cfg);
     defer client.deinit();
-    const target = try resolveTarget(app, &client, &cfg, dev, @hasDecl(Tool, "stdin_free") and Tool.stdin_free);
+    var target = try resolveTarget(app, &client, &cfg, dev, @hasDecl(Tool, "stdin_free") and Tool.stdin_free);
     if (target.device) |d| if (@hasDecl(Tool, "device")) tool_state.device(d);
 
     var bus_buf: [256]session.Event = undefined;
@@ -899,18 +906,41 @@ fn runToolSession(
     defer bus.deinit();
     try interrupts.install(&bus);
 
-    const s = session.Session.open(.{
-        .io = app.io,
-        .gpa = app.gpa,
-        .bus = &bus,
-        .client = &client,
-        .http = &client.http,
-        .own_device_id = cfg.device_id,
-        .target = target.id,
-        .capture_type = capture,
-        .assist_code = target.assist_code,
-    }) catch |err| return openFailure(app, err);
+    const interactive = Io.File.stdin().isTty(app.io) catch false;
+    const remember_codes = capture == 8;
+    var save_code = remember_codes and interactive and target.assist_code != null and
+        cfg.assistCode(target.id) == null and
+        (if (app.env.get("UUCLI_ASSIST_CODE")) |code| code.len == 0 else true);
+    var code_retries: u8 = 0;
+    const s = while (true) {
+        const opened = session.Session.open(.{
+            .io = app.io,
+            .gpa = app.gpa,
+            .bus = &bus,
+            .client = &client,
+            .http = &client.http,
+            .own_device_id = cfg.device_id,
+            .target = target.id,
+            .capture_type = capture,
+            .assist_code = target.assist_code,
+        }) catch |err| {
+            if (!remember_codes or !retryAssistCode(err, client.failure, target.assist_code != null, interactive, code_retries))
+                return openFailure(app, err);
+            try app.err.writeAll("The remote code was rejected or expired, or assistance is disabled. Enter a new code (up to 3 retries).\n");
+            target.assist_code = try readCode(app, target.id, false);
+            code_retries += 1;
+            save_code = true;
+            continue;
+        };
+        break opened;
+    };
+
     defer s.close();
+    if (save_code) {
+        try updateSavedCode(app, target.id, target.assist_code);
+        try app.err.writeAll("The remote code is saved in the config file\n");
+        try app.err.flush();
+    }
     // An assistance host is not in the device list; its platform comes from the room join.
     if (@hasDecl(Tool, "device") and target.device == null) if (s.publisher_platform) |p|
         tool_state.device(.{ .id = target.id, .name = target.id, .platform = .from(p), .online = true, .shared = true });
@@ -1444,4 +1474,19 @@ test "device table and json" {
         \\[{"id":"aeawswhnguarjyo6","name":"office-pc","platform":"windows","online":true,"shared":false},{"id":"m1","name":"家里","platform":"unknown(7)","online":false,"shared":true}]
         \\
     , out.written());
+}
+
+test "assistance code retries require a rejected join and interactive input" {
+    const t = std.testing;
+    const rejected: api.Failure = .{ .status = 400, .code = 1131 };
+    try t.expect(retryAssistCode(error.ConnectFailed, rejected, true, true, 0));
+    try t.expect(retryAssistCode(error.ConnectFailed, rejected, true, true, 2));
+    try t.expect(!retryAssistCode(error.ConnectFailed, rejected, true, true, 3));
+    try t.expect(!retryAssistCode(error.ConnectFailed, rejected, true, false, 0));
+    try t.expect(!retryAssistCode(error.ConnectFailed, rejected, false, true, 0));
+    for ([_]session.OpenError{ error.Refused, error.DeviceBusy, error.NotSignedIn, error.Canceled, error.OutOfMemory, error.Interrupted }) |err|
+        try t.expect(!retryAssistCode(err, rejected, true, true, 0));
+    try t.expect(!retryAssistCode(error.ConnectFailed, .{ .status = 500, .code = 1131 }, true, true, 0));
+    try t.expect(!retryAssistCode(error.ConnectFailed, .{ .status = 400, .code = 2002 }, true, true, 0));
+    try t.expect(!retryAssistCode(error.ConnectFailed, .{}, true, true, 0));
 }

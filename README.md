@@ -136,6 +136,12 @@ as one line from stdin when it is not a terminal and the command does not use st
 taken from the command line. A temporary code can stop working after it was used; ask the host for a
 new one, or for a fixed code to save.
 
+For `term` and `exec` in an interactive terminal, a rejected assistance code prompts for a
+replacement, up to three times. Codes entered interactively are saved after a successful
+connection, replacing an older saved code for that share ID. Non-interactive calls fail
+without prompting again; codes supplied only through the environment are not automatically saved.
+
+
 ## Short forms
 
 For scripts and agents every command has a fixed short form (no prefix matching):
