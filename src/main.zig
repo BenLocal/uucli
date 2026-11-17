@@ -111,6 +111,9 @@ pub const App = struct {
             switch (err) {
                 error.InsecurePermissions => _ = app.fail(.other, "{s} is accessible by group/other; fix with: chmod 600 {s}", .{ path, path }),
                 error.InvalidConfig => _ = app.fail(.other, "{s} is not a valid uucli config", .{path}),
+                error.InvalidEncryptionKey => _ = app.fail(.other, "cannot read the encryption key {s}.key: it must contain 32 bytes with mode 600; restore the original key to read saved codes", .{path}),
+                error.CodeDecryptionFailed => _ = app.fail(.other, "cannot decrypt saved remote codes in {s}: the key or encrypted data is incorrect", .{path}),
+                error.UnsupportedCodeFormat => _ = app.fail(.other, "saved remote codes in {s} use an unsupported format; remove assist_codes and enter the codes again", .{path}),
                 else => _ = app.fail(.other, "cannot read {s}: {t}", .{ path, err }),
             }
             return error.Reported;

@@ -57,6 +57,9 @@ pub const Error = error{
     NoConfigPath,
     /// A non-blocking lock is held by another process.
     Busy,
+    InvalidEncryptionKey,
+    CodeDecryptionFailed,
+    UnsupportedCodeFormat,
 };
 
 /// `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `~/.config/uucli/config.json`.
@@ -86,13 +89,23 @@ pub fn load(arena: Allocator, io: Io, path: []const u8) !Config {
         error.ReadFailed => return r.err.?,
         else => |e| return e,
     };
-    return std.json.parseFromSliceLeaky(Config, arena, bytes, .{
+    var cfg = std.json.parseFromSliceLeaky(Config, arena, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
-        else => error.InvalidConfig,
+        else => return error.InvalidConfig,
     };
+    if (cfg.assist_codes.len != 0) {
+        for (cfg.assist_codes) |entry| if (!std.mem.startsWith(u8, entry.code, code_prefix))
+            return error.UnsupportedCodeFormat;
+        var key = try encryptionKey(io, path, false);
+        defer std.crypto.secureZero(u8, &key);
+        const codes = try arena.dupe(Config.AssistCode, cfg.assist_codes);
+        for (codes) |*entry| entry.code = try decryptCode(arena, key, entry.id, entry.code);
+        cfg.assist_codes = codes;
+    }
+    return cfg;
 }
 
 /// Writes `PATH.tmp` (0600), syncs it and renames it over `path`. Creates the directory (0700).
@@ -100,6 +113,17 @@ pub fn save(io: Io, path: []const u8, cfg: Config) !void {
     const cwd = Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |dir| _ = try cwd.createDirPathStatus(io, dir, .fromMode(0o700));
 
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var stored = cfg;
+    if (cfg.assist_codes.len != 0) {
+        var key = try encryptionKey(io, path, true);
+        defer std.crypto.secureZero(u8, &key);
+        const codes = try arena.dupe(Config.AssistCode, cfg.assist_codes);
+        for (codes) |*entry| entry.code = try encryptCode(arena, io, key, entry.id, entry.code);
+        stored.assist_codes = codes;
+    }
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
     {
@@ -109,11 +133,82 @@ pub fn save(io: Io, path: []const u8, cfg: Config) !void {
         try file.setPermissions(io, .fromMode(0o600));
         var buf: [1024]u8 = undefined;
         var w = file.writer(io, &buf);
-        writeJson(&w.interface, cfg) catch return w.err.?;
+        writeJson(&w.interface, stored) catch return w.err.?;
         w.interface.flush() catch return w.err.?;
         try file.sync(io);
     }
     try cwd.rename(tmp, cwd, path, io);
+}
+
+const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+const code_prefix = "enc:v1:";
+
+/// A random per-config key; encrypted configs never recreate a missing key while loading.
+fn encryptionKey(io: Io, path: []const u8, create: bool) ![Cipher.key_length]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = try std.fmt.bufPrint(&path_buf, "{s}.key", .{path});
+    const cwd = Io.Dir.cwd();
+    const file = cwd.openFile(io, key_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!create) return error.InvalidEncryptionKey;
+            var key: [Cipher.key_length]u8 = undefined;
+            try io.randomSecure(&key);
+            defer std.crypto.secureZero(u8, &key);
+            const out = cwd.createFile(io, key_path, .{
+                .exclusive = true,
+                .permissions = .fromMode(0o600),
+            }) catch |e| switch (e) {
+                error.PathAlreadyExists => return encryptionKey(io, path, false),
+                else => return e,
+            };
+            defer out.close(io);
+            var w = out.writer(io, &.{});
+            try w.interface.writeAll(&key);
+            try w.interface.flush();
+            try out.sync(io);
+            return key;
+        },
+        else => return err,
+    };
+    defer file.close(io);
+    const st = try file.stat(io);
+    if (st.permissions.toMode() & 0o077 != 0 or st.size != Cipher.key_length)
+        return error.InvalidEncryptionKey;
+    var key: [Cipher.key_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
+    var r = file.reader(io, &.{});
+    try r.interface.readSliceAll(&key);
+    return key;
+}
+
+/// Share id is authenticated so ciphertext cannot be moved to another saved host.
+fn encryptCode(arena: Allocator, io: Io, key: [Cipher.key_length]u8, id: []const u8, code: []const u8) ![]const u8 {
+    const raw = try arena.alloc(u8, Cipher.nonce_length + Cipher.tag_length + code.len);
+    defer arena.free(raw);
+    var nonce: [Cipher.nonce_length]u8 = undefined;
+    try io.randomSecure(&nonce);
+    @memcpy(raw[0..Cipher.nonce_length], &nonce);
+    const tag = raw[Cipher.nonce_length..][0..Cipher.tag_length];
+    Cipher.encrypt(raw[Cipher.nonce_length + Cipher.tag_length ..], tag, code, id, nonce, key);
+    const encoder = std.base64.standard.Encoder;
+    const out = try arena.alloc(u8, code_prefix.len + encoder.calcSize(raw.len));
+    @memcpy(out[0..code_prefix.len], code_prefix);
+    _ = encoder.encode(out[code_prefix.len..], raw);
+    return out;
+}
+
+fn decryptCode(arena: Allocator, key: [Cipher.key_length]u8, id: []const u8, stored: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, stored, code_prefix)) return error.UnsupportedCodeFormat;
+    const decoder = std.base64.standard.Decoder;
+    const encoded = stored[code_prefix.len..];
+    const raw = try arena.alloc(u8, decoder.calcSizeForSlice(encoded) catch return error.CodeDecryptionFailed);
+    defer arena.free(raw);
+    decoder.decode(raw, encoded) catch return error.CodeDecryptionFailed;
+    if (raw.len < Cipher.nonce_length + Cipher.tag_length) return error.CodeDecryptionFailed;
+    const out = try arena.alloc(u8, raw.len - Cipher.nonce_length - Cipher.tag_length);
+    errdefer arena.free(out);
+    Cipher.decrypt(out, raw[Cipher.nonce_length + Cipher.tag_length ..], raw[Cipher.nonce_length..][0..Cipher.tag_length].*, id, raw[0..Cipher.nonce_length].*, key) catch return error.CodeDecryptionFailed;
+    return out;
 }
 
 fn writeJson(w: *Io.Writer, cfg: Config) Io.Writer.Error!void {
@@ -267,4 +362,69 @@ test "login lock is exclusive" {
     const first = try lock(io, path, .login);
     defer first.release(io);
     try testing.expectError(error.Busy, lock(io, path, .login));
+}
+
+test "saved assistance codes are encrypted on disk with a private key" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "config.json");
+    var cfg: Config = .{};
+    try cfg.setAssistCode(arena, "share-test", "private-test-code");
+    try save(io, path, cfg);
+    const first = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, first, "private-test-code") == null);
+    try testing.expect(std.mem.indexOf(u8, first, code_prefix) != null);
+    const key_path = try std.fmt.allocPrint(arena, "{s}.key", .{path});
+    const st = try Io.Dir.cwd().statFile(io, key_path, .{});
+    try testing.expectEqual(@as(u64, Cipher.key_length), st.size);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    const back = try load(arena, io, path);
+    try testing.expectEqualStrings("private-test-code", back.assistCode("share-test").?);
+    try save(io, path, back);
+    const second = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096));
+    try testing.expect(!std.mem.eql(u8, first, second));
+    try Io.Dir.cwd().setFilePermissions(io, key_path, .fromMode(0o644), .{});
+    try testing.expectError(error.InvalidEncryptionKey, load(arena, io, path));
+    try Io.Dir.cwd().setFilePermissions(io, key_path, .fromMode(0o600), .{});
+    try Io.Dir.cwd().deleteFile(io, key_path);
+    try testing.expectError(error.InvalidEncryptionKey, load(arena, io, path));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, key_path, .{}));
+}
+
+test "encrypted assistance codes reject tampering wrong keys and swapped hosts" {
+    const gpa = testing.allocator;
+    const key: [Cipher.key_length]u8 = @splat(7);
+    const sealed = try encryptCode(gpa, testing.io, key, "host-a", "private-test-code");
+    defer gpa.free(sealed);
+    const plain = try decryptCode(gpa, key, "host-a", sealed);
+    defer gpa.free(plain);
+    try testing.expectEqualStrings("private-test-code", plain);
+    try testing.expectError(error.CodeDecryptionFailed, decryptCode(gpa, key, "host-b", sealed));
+    try testing.expectError(error.CodeDecryptionFailed, decryptCode(gpa, @as([Cipher.key_length]u8, @splat(8)), "host-a", sealed));
+    const damaged = try gpa.dupe(u8, sealed);
+    defer gpa.free(damaged);
+    damaged[code_prefix.len] = if (damaged[code_prefix.len] == 'A') 'B' else 'A';
+    try testing.expectError(error.CodeDecryptionFailed, decryptCode(gpa, key, "host-a", damaged));
+    for ([_][]const u8{ "enc:v1:!", "enc:v1:", "enc:v1:AAAA" }) |bad|
+        try testing.expectError(error.CodeDecryptionFailed, decryptCode(gpa, key, "host-a", bad));
+    try testing.expectError(error.UnsupportedCodeFormat, decryptCode(gpa, key, "host-a", "legacy-plain-code"));
+}
+
+test "configs without assistance codes need no encryption key" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "config.json");
+    try save(io, path, .{ .device_id = "test-device" });
+    const key_path = try std.fmt.allocPrint(arena, "{s}.key", .{path});
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, key_path, .{}));
+    const cfg = try load(arena, io, path);
+    try testing.expectEqualStrings("test-device", cfg.device_id);
 }

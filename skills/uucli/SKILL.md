@@ -31,6 +31,14 @@ Use an existing account configuration; keep its contents private. Config files
 require mode 0600 and their directory 0700. `logout` clears local account
 credentials while retaining the controller identity.
 
+Saved assistance codes use authenticated encryption. The separate key file is the
+config path plus `.key`, with mode 0600. Keep both files private; access to both
+allows decryption. Login tokens remain unencrypted. If a key is missing or invalid,
+restore the original key rather than generating a replacement for existing ciphertext.
+Old plaintext saved-code entries are unsupported; remove only the `assist_codes`
+entries and enter the codes again. Do not print either file to diagnose a failure.
+
+
 ## Run a command
 
 Prefer `exec` for agent tasks; it opens and closes a new remote terminal and

@@ -141,6 +141,13 @@ replacement, up to three times. Codes entered interactively are saved after a su
 connection, replacing an older saved code for that share ID. Non-interactive calls fail
 without prompting again; codes supplied only through the environment are not automatically saved.
 
+Saved remote codes are encrypted with XChaCha20-Poly1305. The key lives beside the config
+as `config.json.key` (or `UUCLI_CONFIG` plus `.key`), with mode 0600. Keep it private and
+back it up separately: losing it prevents reading saved codes, while access to both files
+allows decryption. Login tokens remain unencrypted. Old plaintext saved-code entries are
+not migrated; remove `assist_codes` from the old config and enter the codes again.
+
+
 
 ## Short forms
 

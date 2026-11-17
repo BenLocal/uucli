@@ -149,11 +149,28 @@ Host office-pc
   "csrf": "csrf claim from the token",
   "account_name": "nickname, display only",
   "sign_key": "optional override; default is upstream DEFAULT_SIGN_KEY",
-  "assist_codes": [{"id": "share id", "code": "remote-assistance code (§5.6)"}]
+  "assist_codes": [{"id": "share id", "code": "enc:v1:BASE64_NONCE_TAG_CIPHERTEXT"}]
 }
 ```
 
 `assist_codes` is written only when non-empty.
+
+Saved assistance codes are encrypted with the Zig standard library's XChaCha20-Poly1305.
+Each save uses a fresh 24-byte nonce from `Io.randomSecure`; the share id is authenticated
+as associated data. The `code` field is `enc:v1:` followed by standard base64 of
+`nonce[24] || tag[16] || ciphertext`. Plaintext exists only in memory during use.
+The random 32-byte key is stored in `CONFIG_PATH.key` (for example `config.json.key`),
+mode 0600, created exclusively and synced before encrypted configuration is written.
+The key is created only when saving codes, never when loading encrypted data.
+Missing, malformed, or group/other-accessible keys and failed authentication cause a
+config load error (exit 1); no fallback to plaintext occurs. Configs without saved
+codes need no key. Existing plaintext entries are unsupported and are not migrated;
+remove the old `assist_codes` entries and enter the codes again.
+
+The key must accompany the config when restoring encrypted codes. Copying the config
+alone does not expose the saved passwords. Anyone who can read both files can decrypt
+them. Account tokens and other config fields remain unchanged and are not encrypted.
+
 
 uucli does not read `~/.config/uuremote/config.json` and does not honor upstream `UU_*` variables.
 
