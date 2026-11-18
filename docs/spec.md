@@ -360,7 +360,8 @@ The code for a share id comes from, in order:
 
 Otherwise (`proxy`, `terminal` without a terminal) → exit 2 naming the two first sources. The code is
 never taken from the command line, where other local users could read it, and never logged. A
-temporary code may stop working after it was used; a wrong or expired code fails the join (§6.1).
+code is not used up by a join: the same code joined the same host repeatedly (§12, 2026-11-18). It
+can still stop working later (cause not established); a wrong or expired code fails the join (§6.1).
 
 ## 6. Connection setup (M2)
 
@@ -1011,7 +1012,7 @@ Real-device log:
 | 2026-11-16 | Windows host `files ls` | `C:\` listed; every subdirectory timed out. The host did answer: its rpc response came as a text message with NUL bytes, and uucli cut it at the first NUL. Fixed; then three subdirectories listed (up to 106 entries) |
 | 2026-11-16 | Windows host `files put` / `get` of a 20 MB file | passed after the fix: sha256 match; put 45 s, get 10 s; `put` of an existing name without `--force` → exit 2. The > 1 GB and > 5000-entry checks of M4 not run yet |
 | 2026-11-16 | Remote assistance by code to a Windows host of another account | room join (v2 path) passed; `exec hostname` printed the host name, exit 0, PowerShell chosen from `publisher_platform`. Without it the POSIX wrapper reached PowerShell, so tool sessions are allowed in assistance rooms |
-| 2026-11-16 | Same share id, same temporary code, a third join | HTTP 400 code 1131: the code had stopped working (used up or assistance turned off; not distinguished). `files` over assistance not tested yet |
+| 2026-11-16 | Same share id, same temporary code, a third join | HTTP 400 code 1131: the code had stopped working. Not caused by use count (see 2026-11-18); likely assistance turned off or the code refreshed on the host (not verified). `files` over assistance not tested yet |
 | 2026-11-16 | `login` method prompt, `login --phone` input checks, send-code request for `00000` (on a copy of the config) | prompt and checks as specified; the send-code request was accepted (code 0) without validating the number. Receiving an SMS and `by_mobile` with a real number not tested yet |
 | 2026-11-16 | `fav edit` rename and rename back; `fav edit --save-code` on a copy of the config | passed: both lists showed each new remark; the code was saved with mode 0600 |
 | 2026-11-16 | `fav list` / `fav list --recent` / `fav add` / `fav rm` against the account | passed: the host joined above was in `recent`; add showed it in both lists as favorite with its remark; re-adding succeeded; rm removed it and the saved code; rm again → exit 4 |
@@ -1021,6 +1022,7 @@ Real-device log:
 | 2026-11-17 | Command module refactor (§9) | Debug build and 84 offline tests passed (the hook checks now run separately for terminal, exec and files). The pre-refactor and refactored binaries matched exit codes, stdout and stderr across 96 offline CLI cases via `tests/cli_parity.py`. Real-host discovery remains blocked by API DNS resolution (`UnknownHostName`). |
 | 2026-11-18 | uucli 0.0.2, shared remote assistance to an official Windows host | Device discovery, favorite listing, terminal listing, two queued commands, exit code propagation, and recovery after an execution timeout passed. Session status showed one active and one waiting command. Stop refused the busy session and succeeded once idle. Directory listing and a 92-byte download passed. An existing destination was protected, and a missing remote file left no partial download. Both `proxy` and `portmap` received the SSH banner. See the [real-device notes](memory/real-device-testing.md#uucli-002-findings) for issues found during this run. |
 | 2026-11-18 | Fix verification on the same Windows host | `exec --json` preserved adjacent Chinese characters and an intentional space. `exec`, `terminal --list` and `files ls` reused an open assistance session without a code. After stop, a new join without a code exited 2. Forwarding an SSH connection through shared `proxy` exited 0 on SIGTERM and 130 on SIGINT. A full stdout target exited 1 for both command results and the proxy stream. A closed stdout pipe also exited 1 for command results. |
+| 2026-11-18 | Reuse of a saved remote-assistance code, official Windows host | Four direct joins (`UUCLI_MUX=0`, no shared connection left afterwards) with the same saved code within 32 s all passed (`exec hostname`). A code is not invalidated by one join. Expiry after a longer time, or after the host restarts or re-enables assistance, not tested |
 
 ## 13. Open questions and protocol drift
 
