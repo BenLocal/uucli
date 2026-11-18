@@ -126,11 +126,28 @@ ssh -o 'ProxyCommand=uucli proxy office-pc 127.0.0.1 22' me@office-pc
 `proxy` carries the byte stream on stdin/stdout, so leave those streams connected
 to SSH. The remote SSH service and its authentication must already be available.
 
-A host serves one connection at a time. All commands for the same DEVICE share one background
-connection. SSH sessions through `proxy` / `portmap` run in parallel (also to different machines
-behind that host); `terminal`, `exec` and `files` run one at a time per DEVICE, a second one waits
-for the first, and none of them disturbs running SSH sessions. `--no-mux` opens a separate
-connection and ends the shared one; do not use it alongside other commands.
+## Manage shared connections
+
+By default, `proxy`, `portmap`, `terminal`, `exec` and `files` share a background
+connection for the same device. SSH sessions can run in parallel, including to
+different machines behind the host. `terminal`, `exec` and `files` take turns
+while SSH sessions continue. `--no-mux` opens a separate connection and ends
+the shared one, interrupting its users.
+
+```sh
+uucli session start office-pc
+uucli session list --json
+uucli session status office-pc --json
+uucli session stop office-pc
+```
+
+By default, shared connections close after 60 seconds of inactivity.
+`session start` opens or reuses one and keeps it open until it is stopped or the
+connection ends. Each `exec` still opens a fresh remote shell. `session list`
+and `session status` inspect local connections, including stream and waiting
+client counts. Use `--assist` with a share ID for `start`, `status` or `stop`.
+`session stop` refuses a busy connection with exit 6. Use `--force` only when
+the task calls for interrupting active streams or tools and canceling queued work.
 
 ## Use remote assistance and favorites
 
@@ -158,12 +175,14 @@ remark; removing a favorite also removes its saved code. A temporary assistance
 code may need replacement after use. A saved favorite can be used as an ordinary
 target without `--assist`.
 
-For interactive `terminal` and `exec`, a join rejected with API 1131 asks for a new
-code up to three times. This error may also mean assistance is disabled. A code
-entered interactively is saved after the connection succeeds, including a replacement
-for a stale saved code. Environment-only codes are not automatically saved.
-Non-interactive calls do not prompt again. Retry applies only to setup, before
-the remote command starts.
+On a direct connection, interactive `terminal` and `exec` prompt for a new code
+up to three times after API 1131 during setup. With a shared connection, the
+background process returns the rejection and the command exits. If the code
+is stale, obtain a fresh one from the host owner and rerun with
+`UUCLI_ASSIST_CODE` or update the saved code with `fav edit --save-code`.
+API 1131 can also mean assistance is disabled. A code entered interactively is
+saved after the connection succeeds, including a replacement for a stale saved
+code. Environment-only codes are not automatically saved.
 
 
 ## Interpret failures
