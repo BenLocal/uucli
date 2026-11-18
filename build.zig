@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 const std = @import("std");
 
-const version = "0.0.1";
+const version = "0.0.2";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
