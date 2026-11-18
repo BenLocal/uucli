@@ -21,7 +21,8 @@ const signedInClient = app_mod.signedInClient;
 const DeviceArg = target_mod.DeviceArg;
 const Target = target_mod.Target;
 const sharedDevice = target_mod.sharedDevice;
-const resolveTarget = target_mod.resolveTarget;
+const resolveIdentity = target_mod.resolveIdentity;
+const assistCode = target_mod.assistCode;
 const readCode = target_mod.readCode;
 const updateSavedCode = target_mod.updateSavedCode;
 const muxEnabled = mux_client.muxEnabled;
@@ -170,14 +171,15 @@ fn retryAssistCode(err: session.OpenError, failure: api.Failure, assist: bool, i
 /// needed. Null: no shared session possible here (socket path too long).
 fn runLeased(
     app: *App,
-    dev: DeviceArg,
+    cfg: *const config.Config,
     target: Target,
-    save_code: bool,
+    remember_prompt: bool,
     comptime Tool: type,
     tool_state: *Tool,
     comptime worker: fn (*App, *Tool) Exit,
 ) !?Exit {
     const io = app.io;
+    const dev = sharedDevice(target);
     const cfg_path = try app.configPath();
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch {
@@ -185,6 +187,7 @@ fn runLeased(
         return null;
     };
     var granted: ?MuxLease = null;
+    var join_code: ?[]const u8 = null;
     for (0..3) |_| {
         switch (try muxLease(io, sock)) {
             .granted => |g| {
@@ -196,17 +199,17 @@ fn runLeased(
                 log.info("the running shared session does not take leases; connecting directly", .{});
                 return null;
             },
-            .gone => if (try startMuxServer(app, cfg_path, dev, sock, target.assist_code)) |code| return code,
+            .gone => {
+                if (dev.assist and join_code == null)
+                    join_code = try assistCode(app, cfg, target.id, @hasDecl(Tool, "stdin_free") and Tool.stdin_free);
+                if (try startMuxServer(app, cfg_path, dev, sock, join_code)) |exit| return exit;
+            },
         }
     }
     const g = granted orelse return app.fail(.connect, "the shared session did not take the request", .{});
     var client: lease.Client = .{ .io = io, .gpa = app.gpa, .conn = g.conn };
     defer g.conn.close(io);
-    if (save_code) {
-        try updateSavedCode(app, target.id, target.assist_code);
-        try app.err.writeAll("The remote code is saved in the config file\n");
-        try app.err.flush();
-    }
+    if (join_code != null and remember_prompt) try savePromptedCode(app, target.id, join_code.?);
     // An assistance host is not in the device list; the server knows its platform from the join.
     if (@hasDecl(Tool, "device") and target.device == null)
         tool_state.device(.{ .id = target.id, .name = target.id, .platform = .from(g.platform), .online = true, .shared = true });
@@ -251,11 +254,17 @@ fn runLeased(
             else => {},
         }
     }
-    const code = task.await(io);
-    if (@hasDecl(Tool, "completed") and tool_state.completed()) return code;
+    const result = task.await(io);
+    if (@hasDecl(Tool, "completed") and tool_state.completed()) return result;
     if (interrupted) return interruptedExit();
-    if (client.lost.load(.acquire) and code == .ok) return app.fail(.connect, "the shared session ended", .{});
-    return code;
+    if (client.lost.load(.acquire) and result == .ok) return app.fail(.connect, "the shared session ended", .{});
+    return result;
+}
+
+fn savePromptedCode(app: *App, id: []const u8, code: []const u8) !void {
+    try updateSavedCode(app, id, code);
+    try app.err.writeAll("The remote code is saved in the config file\n");
+    try app.err.flush();
 }
 
 /// One session for a tool that runs `worker` (on its own task) while this task routes messages.
@@ -271,8 +280,18 @@ pub fn runToolSession(
     var client: api.Client = undefined;
     try signedInClient(app, &client, &cfg);
     defer client.deinit();
-    var target = try resolveTarget(app, &client, &cfg, dev, @hasDecl(Tool, "stdin_free") and Tool.stdin_free);
+    var target = try resolveIdentity(app, &client, &cfg, dev);
     if (target.device) |d| if (@hasDecl(Tool, "device")) tool_state.device(d);
+
+    const interactive = Io.File.stdin().isTty(app.io) catch false;
+    const remember_codes = capture == 8;
+    const remember_prompt = remember_codes and interactive and target.assist and
+        cfg.assistCode(target.id) == null and
+        (if (app.env.get("UUCLI_ASSIST_CODE")) |code| code.len == 0 else true);
+    if (!dev.own_session and muxEnabled(app))
+        if (try runLeased(app, &cfg, target, remember_prompt, Tool, tool_state, worker)) |code| return code;
+    if (target.assist)
+        target.assist_code = try assistCode(app, &cfg, target.id, @hasDecl(Tool, "stdin_free") and Tool.stdin_free);
 
     var bus_buf: [256]session.Event = undefined;
     var bus: session.Bus = undefined;
@@ -280,13 +299,7 @@ pub fn runToolSession(
     defer bus.deinit();
     try interrupts.install(&bus);
 
-    const interactive = Io.File.stdin().isTty(app.io) catch false;
-    const remember_codes = capture == 8;
-    var save_code = remember_codes and interactive and target.assist_code != null and
-        cfg.assistCode(target.id) == null and
-        (if (app.env.get("UUCLI_ASSIST_CODE")) |code| code.len == 0 else true);
-    if (!dev.own_session and muxEnabled(app))
-        if (try runLeased(app, sharedDevice(target), target, save_code, Tool, tool_state, worker)) |code| return code;
+    var save_code = remember_prompt;
     var code_retries: u8 = 0;
     const s = while (true) {
         const opened = session.Session.open(.{
@@ -312,11 +325,7 @@ pub fn runToolSession(
     };
 
     defer s.close();
-    if (save_code) {
-        try updateSavedCode(app, target.id, target.assist_code);
-        try app.err.writeAll("The remote code is saved in the config file\n");
-        try app.err.flush();
-    }
+    if (save_code) try savePromptedCode(app, target.id, target.assist_code.?);
     // An assistance host is not in the device list; its platform comes from the room join.
     if (@hasDecl(Tool, "device") and target.device == null) if (s.publisher_platform) |p|
         tool_state.device(.{ .id = target.id, .name = target.id, .platform = .from(p), .online = true, .shared = true });

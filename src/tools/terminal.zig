@@ -6,6 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const wire = @import("../wire.zig");
 const session_mod = @import("../session.zig");
+const tty = @import("../tty.zig");
 
 const log = std.log.scoped(.terminal);
 
@@ -553,25 +554,35 @@ pub const Stripper = struct {
     nparams: u8 = 0,
     row: u32 = 1,
     col: u32 = 1,
+    utf8_bytes: [4]u8 = undefined,
+    utf8_len: u3 = 0,
+    utf8_used: u3 = 0,
 
     pub fn feed(s: *Stripper, gpa: Allocator, out: *std.ArrayList(u8), data: []const u8) Allocator.Error!void {
         for (data) |b| switch (s.state) {
             .text => switch (b) {
-                0x1b => s.state = .esc,
+                0x1b => {
+                    s.utf8_used = 0;
+                    s.state = .esc;
+                },
                 '\n' => {
+                    s.utf8_used = 0;
                     try out.append(gpa, '\n');
                     s.row += 1;
                     s.col = 1;
                 },
-                '\r' => s.col = 1,
+                '\r' => {
+                    s.utf8_used = 0;
+                    s.col = 1;
+                },
                 '\t' => {
+                    s.utf8_used = 0;
                     try out.append(gpa, '\t');
                     s.col += 1;
                 },
                 else => if (b >= 0x20 and b != 0x7f) {
                     try out.append(gpa, b);
-                    // One column per character: count UTF-8 lead bytes only.
-                    if (b & 0xc0 != 0x80) s.col += 1;
+                    s.advanceColumn(b);
                 },
             },
             .esc => switch (b) {
@@ -610,6 +621,25 @@ pub const Stripper = struct {
             },
             .osc_esc => s.state = if (b == '\\') .text else .osc,
         };
+    }
+
+    fn advanceColumn(s: *Stripper, byte: u8) void {
+        if (byte & 0xc0 != 0x80) {
+            s.col += 1;
+            s.utf8_used = 0;
+            if (byte < 0x80) return;
+            s.utf8_len = std.unicode.utf8ByteSequenceLength(byte) catch return;
+            s.utf8_bytes[0] = byte;
+            s.utf8_used = 1;
+        } else if (s.utf8_used != 0) {
+            s.utf8_bytes[s.utf8_used] = byte;
+            s.utf8_used += 1;
+            if (s.utf8_used == s.utf8_len) {
+                s.utf8_used = 0;
+                const cp = std.unicode.utf8Decode(s.utf8_bytes[0..s.utf8_len]) catch return;
+                s.col += tty.codepointWidth(cp) - 1;
+            }
+        }
     }
 
     fn moveTo(s: *Stripper, gpa: Allocator, out: *std.ArrayList(u8), row: u32, col: u32) Allocator.Error!void {
@@ -769,6 +799,17 @@ test "exec: cursor positioning instead of CR LF" {
     const r = extract(text.items, "0f1d96d3d6c3a63c").?;
     try testing.expectEqualStrings(" Status Name\n ------ ----\nRunning sshd\n", r.output);
     try testing.expectEqual(@as(i64, 0), r.code);
+}
+
+test "exec: ConPTY cursor positions use display columns for wide characters" {
+    // The first line has adjacent wide characters. The second has one real space between them.
+    const raw = "ZZBEGIN中\x1b[4;10H文\x1b[4;12HXY\x1b[5;1HZZSPACE中\x1b[5;11H文\x1b[5;13HXY";
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var stripper: Stripper = .{ .row = 4 };
+    // Feed individual bytes so the UTF-8 characters and the escape sequences cross frame boundaries.
+    for (0..raw.len) |i| try stripper.feed(testing.allocator, &text, raw[i .. i + 1]);
+    try testing.expectEqualStrings("ZZBEGIN中文XY\nZZSPACE中 文XY", text.items);
 }
 
 test "exec: wrapper lines" {

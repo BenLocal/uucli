@@ -2,6 +2,13 @@
 
 > 对官方 Windows / Mac 被控端做实机验证时踩过的坑：被控端状态、主控端互斥、解锁、官方 CLI 对照。
 
+## uucli 0.0.2 findings
+
+- 2026-11-18: After `session start --assist ID`, `session status` showed a pinned connection. With no saved code, no `UUCLI_ASSIST_CODE` and stdin closed, `exec`, `terminal --list` and `files ls` exited 2 in the released binary. Target resolution read the code before trying to lease the existing connection. The patched tool path resolves the target first and reads the code only if it needs a new connection.
+- 2026-11-18: Windows `exec --json` returned `中 文` for a command that printed `中文`. A command built from ASCII code points reproduced it. Raw ConPTY output from a synthetic string showed two-column cursor advances for each Chinese character. The parser previously counted one column per character and treated the difference as a space. The regression feeds that sequence one byte at a time and checks that an intentional space still appears.
+- 2026-11-18: Sending SIGTERM to a shared `proxy` after receiving an SSH banner killed the process (shell status 143). The shared branch returned before the direct branch could install signal handling. Repeating the test with the patched relay returned 0 and left the shared connection open.
+- 2026-11-18: On Linux, both `uucli --version >/dev/full` and `uucli session list --json >/dev/full` returned 0 in the released binary. The patched startup path checks the writer's recorded error after flushing, so it also detects writes that failed before the final flush.
+
 - 2026-11-15 Windows 被控端打开终端返回 `401 device_not_logged_in` → 原因是被控端**锁屏**，不是账号没登录、也不是协议问题 → 先把被控端解锁到桌面再连。佐证：同一时刻官方 `uuyc-cli term -d DEVICE list` 也失败（`Terminal environment check timed out`，code 105）；解锁并断开其他主控端后，uucli 不发任何密码就打开了终端并执行命令成功。
 - 2026-11-15 加入房间返回 API `2002`（uucli 报 `the device is being controlled from another device`，退出码 6）→ 被控端同一时间只接受一个主控端，官方 app 的远程桌面窗口、app 里打开的终端都算 → 让用户在 app 里退出远控 / 终端页面后再试。注意本机 `uuyc-cli device status` 显示 0 个连接不代表没人占用，占用者可能是手机或其他设备上的 app。
 - 2026-11-15 尝试由 uucli 自己发被控端系统密码完成验证，两种格式 Windows 被控端都**没有任何回应**：CONTROL 上的 SimpleAction `15 AUTO_UNLOCK_SYSTEM` + `{"key": …}`（上游 Linux 被控端的格式），以及 TERM 帧 `UNLOCK_REQ (14)` + `{"password": …}`（上游定义了常量但没人实现）。结论：这两条都不是官方 Windows 被控端接受密码的方式；真实格式未知，要做需从官方客户端找。

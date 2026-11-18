@@ -36,13 +36,49 @@ pub fn proxyViaMux(app: *App, dev: DeviceArg, assist_code: ?[]const u8, host: []
     for (0..3) |_| switch (try muxOpen(app.io, sock, host, port)) {
         .conn => |conn| {
             defer conn.close(app.io);
-            try muxRelay(app.io, conn, .stdio);
-            return .ok;
+            return try relayProxy(app, conn);
         },
         .refused => |reply| return muxRefused(app, reply),
         .gone => if (try startMuxServer(app, cfg_path, dev, sock, assist_code)) |code| return code,
     };
     return app.fail(.connect, "the shared session did not take the connection", .{});
+}
+
+fn relayProxy(app: *App, conn: Io.net.Stream) !Exit {
+    const io = app.io;
+    var bus_buf: [16]session.Event = undefined;
+    var bus: session.Bus = undefined;
+    try bus.init(io, &bus_buf);
+    defer bus.deinit();
+    try interrupts.install(&bus);
+
+    const Result = union(enum) { interrupt: Io.Cancelable!void, relay: anyerror!void };
+    var results: [2]Result = undefined;
+    var race: Io.Select(Result) = .init(io, &results);
+    defer race.cancelDiscard();
+    try race.concurrent(.interrupt, waitForInterrupt, .{&bus});
+    try race.concurrent(.relay, muxRelay, .{ io, conn, .stdio });
+    switch (try race.await()) {
+        .interrupt => |result| try result,
+        .relay => |result| {
+            if (interrupts.last() == null) {
+                result catch |err| switch (err) {
+                    error.WriteFailed => return app.fail(.other, "cannot write stdout", .{}),
+                    else => return err,
+                };
+                return .ok;
+            }
+        },
+    }
+    return interruptedExit();
+}
+
+fn waitForInterrupt(bus: *session.Bus) Io.Cancelable!void {
+    while (true) {
+        const event = try bus.next();
+        defer event.deinit();
+        if (event == .interrupt) return;
+    }
 }
 
 const MuxOpen = union(enum) {
@@ -103,7 +139,7 @@ const MuxLocal = union(enum) { stdio, tcp: Io.net.Stream };
 /// Copies bytes between `local` and the shared-session stream `conn` until the stream ends. The
 /// end of local input half-closes the stream, so the target's remaining output still arrives.
 fn muxRelay(io: Io, conn: Io.net.Stream, local: MuxLocal) !void {
-    const U = union(enum) { up: void, down: void };
+    const U = union(enum) { up: void, down: Io.Writer.Error!void };
     var buf: [2]U = undefined;
     var sel: Io.Select(U) = .init(io, &buf);
     defer sel.cancelDiscard();
@@ -111,10 +147,10 @@ fn muxRelay(io: Io, conn: Io.net.Stream, local: MuxLocal) !void {
     try sel.concurrent(.down, muxDown, .{ io, conn, local });
     while (true) switch (try sel.await()) {
         .up => conn.shutdown(io, .send) catch {},
-        .down => {
+        .down => |result| {
             // Wake the other direction if it still waits for local input.
             if (local == .tcp) local.tcp.shutdown(io, .recv) catch {};
-            return;
+            return result;
         },
     };
 }
@@ -126,37 +162,37 @@ fn muxUp(io: Io, conn: Io.net.Stream, local: MuxLocal) void {
     switch (local) {
         .stdio => {
             var r = Io.File.stdin().readerStreaming(io, &rb);
-            copyAll(&r.interface, &w.interface);
+            copyAll(&r.interface, &w.interface) catch {};
         },
         .tcp => |t| {
             var r = t.reader(io, &rb);
-            copyAll(&r.interface, &w.interface);
+            copyAll(&r.interface, &w.interface) catch {};
         },
     }
 }
 
-fn muxDown(io: Io, conn: Io.net.Stream, local: MuxLocal) void {
+fn muxDown(io: Io, conn: Io.net.Stream, local: MuxLocal) Io.Writer.Error!void {
     var rb: [16 * 1024]u8 = undefined;
     var r = conn.reader(io, &rb);
     var wb: [64]u8 = undefined;
     switch (local) {
         .stdio => {
             var w = Io.File.stdout().writerStreaming(io, &wb);
-            copyAll(&r.interface, &w.interface);
+            try copyAll(&r.interface, &w.interface);
         },
         .tcp => |t| {
             var w = t.writer(io, &wb);
-            copyAll(&r.interface, &w.interface);
+            copyAll(&r.interface, &w.interface) catch {};
         },
     }
 }
 
 /// Copies until end of input or an error on either side, flushing each chunk.
-fn copyAll(r: *Io.Reader, w: *Io.Writer) void {
+fn copyAll(r: *Io.Reader, w: *Io.Writer) Io.Writer.Error!void {
     while (true) {
         const data = r.peekGreedy(1) catch return;
-        w.writeAll(data) catch return;
-        w.flush() catch return;
+        try w.writeAll(data);
+        try w.flush();
         r.toss(data.len);
     }
 }

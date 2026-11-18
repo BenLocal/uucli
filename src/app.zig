@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const config = @import("config.zig");
 const api = @import("api.zig");
 const interrupts = @import("interrupts.zig");
+const tty = @import("tty.zig");
 
 pub var log_level: std.log.Level = .warn;
 
@@ -144,14 +145,7 @@ pub fn pad(w: *Io.Writer, s: []const u8, width: usize) !void {
 pub fn displayWidth(s: []const u8) usize {
     var n: usize = 0;
     var it = (std.unicode.Utf8View.init(s) catch return s.len).iterator();
-    while (it.nextCodepoint()) |cp| {
-        const wide = (cp >= 0x1100 and cp <= 0x115F) or (cp >= 0x2E80 and cp <= 0xA4CF) or
-            (cp >= 0xAC00 and cp <= 0xD7A3) or (cp >= 0xF900 and cp <= 0xFAFF) or
-            (cp >= 0xFE30 and cp <= 0xFE4F) or (cp >= 0xFF00 and cp <= 0xFF60) or
-            (cp >= 0xFFE0 and cp <= 0xFFE6) or (cp >= 0x1F300 and cp <= 0x1FAFF) or
-            (cp >= 0x20000 and cp <= 0x3FFFD);
-        n += if (wide) 2 else 1;
-    }
+    while (it.nextCodepoint()) |cp| n += tty.codepointWidth(cp);
     return n;
 }
 

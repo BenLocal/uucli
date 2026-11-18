@@ -20,9 +20,10 @@ pub const DeviceArg = struct {
     name: []const u8 = "",
 };
 
-/// Where a session goes: an account device, or a remote-assistance host (share id and code).
+/// Where a session goes: an account device or a remote-assistance share ID.
 pub const Target = struct {
     id: []const u8,
+    assist: bool = false,
     assist_code: ?[]const u8 = null,
     /// Set for account devices.
     device: ?api.Device = null,
@@ -30,13 +31,20 @@ pub const Target = struct {
 };
 
 pub fn sharedDevice(target: Target) DeviceArg {
-    return .{ .query = target.id, .assist = target.assist_code != null, .name = target.name };
+    return .{ .query = target.id, .assist = target.assist, .name = target.name };
 }
 
 /// DEVICE → target (spec §3.3); exit 2 when ambiguous, 4 when unknown or offline. `stdin_free`:
 /// the tool does not read stdin, so a code may be read from it when it is not a terminal.
 pub fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, dev: DeviceArg, stdin_free: bool) !Target {
-    if (dev.assist) return .{ .id = dev.query, .assist_code = try assistCode(app, cfg, dev.query, stdin_free) };
+    var target = try resolveIdentity(app, client, cfg, dev);
+    if (target.assist) target.assist_code = try assistCode(app, cfg, target.id, stdin_free);
+    return target;
+}
+
+/// Resolve the device before deciding whether a new room join needs credentials.
+pub fn resolveIdentity(app: *App, client: *api.Client, cfg: *const config.Config, dev: DeviceArg) !Target {
+    if (dev.assist) return .{ .id = dev.query, .assist = true };
     const devices = try fetchDevices(app, client, cfg);
     switch (try api.resolveDevice(app.arena, devices, dev.query)) {
         .found => |d| {
@@ -55,7 +63,7 @@ pub fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, 
     }
     const saved = try fetchSaved(app, client, .favorites);
     switch (try api.resolveSaved(app.arena, saved, dev.query)) {
-        .found => |f| return .{ .id = f.id, .assist_code = try assistCode(app, cfg, f.id, stdin_free), .name = f.name },
+        .found => |f| return .{ .id = f.id, .assist = true, .name = f.name },
         .not_found => {
             _ = app.fail(.no_device, "no device {s}: see `uucli device list` and `uucli fav list`", .{dev.query});
             return error.ReportedNoDevice;
@@ -69,7 +77,7 @@ pub fn resolveTarget(app: *App, client: *api.Client, cfg: *const config.Config, 
 }
 
 /// The code for share `id`: UUCLI_ASSIST_CODE, else the saved one, else asked for.
-fn assistCode(app: *App, cfg: *const config.Config, id: []const u8, stdin_free: bool) ![]const u8 {
+pub fn assistCode(app: *App, cfg: *const config.Config, id: []const u8, stdin_free: bool) ![]const u8 {
     if (app.env.get("UUCLI_ASSIST_CODE")) |c| if (c.len != 0) return c;
     if (cfg.assistCode(id)) |c| return c;
     return readCode(app, id, stdin_free);
@@ -169,6 +177,6 @@ test "shared connection identity uses resolved ids and assistance mode" {
         const dev = sharedDevice(.{ .id = d.id, .name = d.name, .device = d });
         try t.expectEqualStrings(try mux.path(&first, "config.json", false, "host-1", .sock), try mux.path(&second, "config.json", dev.assist, dev.query, .sock));
     }
-    const favorite = sharedDevice(.{ .id = "123456789", .name = "office-pc", .assist_code = "test-code" });
+    const favorite = sharedDevice(.{ .id = "123456789", .name = "office-pc", .assist = true });
     try t.expectEqualStrings(try mux.path(&first, "config.json", true, "123456789", .sock), try mux.path(&second, "config.json", favorite.assist, favorite.query, .sock));
 }

@@ -76,6 +76,7 @@ const usage_text =
 ;
 
 pub fn main(init: std.process.Init) u8 {
+    @import("interrupts.zig").ignoreBrokenPipe();
     var out_buf: [4096]u8 = undefined;
     var err_buf: [1024]u8 = undefined;
     // Streaming, not positional: appending to a redirected file must not overwrite it.
@@ -90,8 +91,9 @@ pub fn main(init: std.process.Init) u8 {
         .err = &err_w.interface,
     };
     const args = init.minimal.args.toSlice(app.arena) catch return @backingInt(Exit.other);
-    const code = run(&app, args[1..]);
+    var code = run(&app, args[1..]);
     app.out.flush() catch {};
+    if (out_w.err) |err| code = app.fail(.other, "cannot write stdout: {t}", .{err});
     app.err.flush() catch {};
     return @backingInt(code);
 }

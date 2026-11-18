@@ -145,12 +145,15 @@ One regular file per transfer. Remote paths are passed through as written. `get`
 ## Remote assistance
 
 A host of another account that turned on remote assistance gives out a share id and a code (the
-「开始协助」 invitation). Pass the share id with `--assist`; uucli asks for the code without echoing it:
+「开始协助」 invitation). Pass the share id with `--assist`. When opening a new session, uucli
+can prompt for the code without echoing it.
 
 ```sh
 uucli exec --assist 123456789 -- hostname
 uucli term --assist 123456789
 ```
+
+`exec`, `term` and `files` reuse an open shared session without prompting for the code.
 
 Favorites are stored on your account, like in the official apps, and are reachable by name:
 

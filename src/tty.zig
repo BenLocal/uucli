@@ -5,6 +5,16 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 
+/// Display columns for a printable code point. East Asian wide characters take two columns.
+pub fn codepointWidth(cp: u21) u2 {
+    const wide = (cp >= 0x1100 and cp <= 0x115F) or (cp >= 0x2E80 and cp <= 0xA4CF) or
+        (cp >= 0xAC00 and cp <= 0xD7A3) or (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0xFE30 and cp <= 0xFE4F) or (cp >= 0xFF00 and cp <= 0xFF60) or
+        (cp >= 0xFFE0 and cp <= 0xFFE6) or (cp >= 0x1F300 and cp <= 0x1FAFF) or
+        (cp >= 0x20000 and cp <= 0x3FFFD);
+    return if (wide) 2 else 1;
+}
+
 /// tcgetattr. On Linux the ioctl itself: Zig 0.17.1's `posix.termios` is the kernel's 44-byte struct,
 /// but glibc's tcgetattr writes its own 60-byte one and overruns it (a stack-protector abort in
 /// ReleaseSafe).

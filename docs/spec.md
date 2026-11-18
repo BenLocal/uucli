@@ -52,8 +52,10 @@ Non-goals: remote desktop, audio/video, clipboard, gamepad, any GUI, acting as a
 | 6 | Remote side refused or timed out: API `2002` (host already being controlled), port-forward target rejected, RPC timeout, remote shell/file error |
 | 130 | Interrupted by SIGINT (only where Ctrl-C reaches uucli, i.e. not inside `terminal`) |
 
-SIGTERM ends `portmap` / `proxy` like SIGINT but exits 0, so a service manager stopping the unit
-sees a clean exit. SIGPIPE is ignored: a closed local socket or stdout is a write error.
+During forwarding, SIGTERM ends `portmap` and `proxy` with exit 0 in both direct and shared mode.
+SIGINT exits 130.
+The CLI ignores SIGPIPE. Failure to write command results to stdout exits 1 and reports the
+write failure on stderr.
 
 ### 3.3 `DEVICE` resolution
 
@@ -643,9 +645,10 @@ clients take turns instead of being multiplexed:
 - The server queues up to 256 messages for the holder; a holder that falls behind loses the lease
   (connection closed). The lease ends when either side closes the connection; the client then
   sees the session as ended (exit 5 unless its result is already in).
-- Codes and saving work as without a lease (§5.5), except that a rejected code is not asked for
-  again: the server's error is relayed. A server that answers `LEASE` with `ERR …` predates leases;
-  the client then opens a session of its own.
+- `terminal`, `exec` and `files` can lease an existing assistance session without a code. They
+  read the code only when they need to start a new session (§5.6). If the shared server rejects
+  the code, the command reports the error and exits. A server that answers `LEASE` with `ERR …`
+  predates leases. The client then opens a session of its own.
 - SIGINT / SIGTERM reach the tool as before (Ctrl-C to the remote command, cancel the transfer,
   detach); the lease is returned when the client exits.
 
@@ -892,9 +895,10 @@ fails the terminal).
     does not end with `exit`: on the official Windows host, a shell that exits at once loses its
     last screen update, end marker included.
   - POSIX: `eval` of COMMAND in single quotes, then `exit CODE`.
-- Output is the terminal screen stream, so stdout and stderr are merged. ANSI sequences are
-  stripped; ConPTY cursor moves (`ESC[nC`, `ESC[row;colH`, `G`, `d`) become spaces and newlines.
-  Blank lines at the start and end are dropped. More than 16 MiB → exit 6.
+- Output is the terminal screen stream, so stdout and stderr are merged. The client removes
+  ANSI sequences and uses display columns when converting ConPTY cursor moves (`ESC[nC`,
+  `ESC[row;colH`, `G`, `d`) to spaces and newlines. Wide Chinese characters occupy two columns.
+  The client drops blank lines at the start and end. More than 16 MiB → exit 6.
 - `--timeout SECONDS` (default 300, 0 = none): past it, uucli sends Ctrl-C and exits 6. SIGINT /
   SIGTERM also send Ctrl-C and end the run.
 - Exit code: the remote CODE if 0..255 (so 1..6 can come from either side; stderr says which), else
@@ -1015,6 +1019,8 @@ Real-device log:
 | 2026-11-17 | Leases on the shared session (§7.3), official Windows host | passed while an ssh `proxy` stream stayed up on the same session: `exec` (≈5.7 s with a new server, then about 1 s), two `exec` at once (served one after the other), `files ls` (0.5 s) and `files get` (92-byte file), `terminal --list`, an interactive `terminal` with `~.` (exit 0). The host lists one terminal session and reuses its id for every open |
 | 2026-11-17 | Local session management (§7.4) | Offline tests passed with Unix sockets and the in-process RTC host: repeated keep, idle expiry, management during active / waiting leases, busy stop refusal and forced teardown. CLI tests cover config isolation, names / IDs, stale sockets, JSON, and idempotent start / stop. Real-host validation is pending: device discovery and system curl both failed to resolve the API hostname. |
 | 2026-11-17 | Command module refactor (§9) | Debug build and 84 offline tests passed (the hook checks now run separately for terminal, exec and files). The pre-refactor and refactored binaries matched exit codes, stdout and stderr across 96 offline CLI cases via `tests/cli_parity.py`. Real-host discovery remains blocked by API DNS resolution (`UnknownHostName`). |
+| 2026-11-18 | uucli 0.0.2, shared remote assistance to an official Windows host | Device discovery, favorite listing, terminal listing, two queued commands, exit code propagation, and recovery after an execution timeout passed. Session status showed one active and one waiting command. Stop refused the busy session and succeeded once idle. Directory listing and a 92-byte download passed. An existing destination was protected, and a missing remote file left no partial download. Both `proxy` and `portmap` received the SSH banner. See the [real-device notes](memory/real-device-testing.md#uucli-002-findings) for issues found during this run. |
+| 2026-11-18 | Fix verification on the same Windows host | `exec --json` preserved adjacent Chinese characters and an intentional space. `exec`, `terminal --list` and `files ls` reused an open assistance session without a code. After stop, a new join without a code exited 2. Forwarding an SSH connection through shared `proxy` exited 0 on SIGTERM and 130 on SIGINT. A full stdout target exited 1 for both command results and the proxy stream. A closed stdout pipe also exited 1 for command results. |
 
 ## 13. Open questions and protocol drift
 
