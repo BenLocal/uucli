@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 .{
     .name = .uucli,
-    .version = "0.0.2",
+    .version = "0.0.3",
     .fingerprint = 0x1c4640224d95be2d,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
