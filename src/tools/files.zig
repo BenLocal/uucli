@@ -585,11 +585,16 @@ pub const Files = struct {
         if (f.progress) |*p| p.started = Io.Clock.awake.now(f.io);
     }
 
+    /// Widened: `done * ns_per_s` overflows u64 above about 17 GiB.
+    fn bytesPerSecond(done: u64, elapsed_ns: u64) u64 {
+        return std.math.lossyCast(u64, @as(u128, done) * std.time.ns_per_s / elapsed_ns);
+    }
+
     fn drawProgress(f: *Files, final: bool) void {
         const p = if (f.progress) |*x| x else return;
         const now = Io.Clock.awake.now(f.io);
         const elapsed_ns: u64 = @intCast(@max(1, p.started.durationTo(now).nanoseconds));
-        const rate = f.done * std.time.ns_per_s / elapsed_ns;
+        const rate = bytesPerSecond(f.done, elapsed_ns);
         var eta_buf: [24]u8 = undefined;
         const eta = if (rate == 0 or f.done >= f.total) "" else std.fmt.bufPrint(&eta_buf, "  ETA {d}s", .{(f.total - f.done) / rate}) catch "";
         p.w.print("\r{d}/{d} bytes  {d} KiB/s{s}\x1b[K", .{ f.done, f.total, rate / 1024, eta }) catch return;
@@ -634,6 +639,12 @@ test "safeRelative, deflate/inflate" {
 
 test {
     std.testing.refAllDecls(Files);
+}
+
+test "transfer rate of files above 17 GiB" {
+    const gib: u64 = 1024 * 1024 * 1024;
+    try testing.expectEqual(20 * gib / 10, Files.bytesPerSecond(20 * gib, 10 * std.time.ns_per_s));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), Files.bytesPerSecond(std.math.maxInt(u64), 1));
 }
 
 test "safeRelative rejects traversal with either host separator" {
