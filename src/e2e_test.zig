@@ -3,6 +3,7 @@
 //! server and a fake host built on libdatachannel, forwarding to a local TCP echo server. Exercises
 //! room join, control request, offer/answer/candidates, echo, SYN/SYN-ACK, DATA both ways and CLOSE.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const net = std.Io.net;
@@ -723,6 +724,7 @@ fn muxRoundTripTask(io: Io, sock: []const u8, echo_port: u16, payload: []const u
 }
 
 test "shared proxy session: clients name their targets over a unix socket" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     const gpa = testing.allocator;
     testing.log_level = .debug;
@@ -946,6 +948,7 @@ test "terminal end to end through a fake host" {
 }
 
 test "terminal on a lease of the shared session, next to a port stream" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     const gpa = testing.allocator;
     testing.log_level = .debug;
