@@ -163,7 +163,8 @@ pub const Socket = struct {
                 .continuation => if (msg_opcode == null) return error.ProtocolError,
                 _ => return error.ProtocolError,
             }
-            if (msg.items.len + len > max_message) return error.MessageTooLarge;
+            // Not `msg.items.len + len`: a peer-chosen 64-bit length would overflow it.
+            if (len > max_message - msg.items.len) return error.MessageTooLarge;
             const start = msg.items.len;
             try msg.resize(gpa, start + @as(usize, @intCast(len)));
             try r.readSliceAll(msg.items[start..]);
@@ -375,4 +376,35 @@ test "client against a local server" {
     try testing.expectEqualStrings("40", m3.data);
     try testing.expectError(error.Closed, s.receive(testing.allocator));
     try testing.expectEqualStrings("room-token", seen[0..seen_len]);
+}
+
+fn hugeContinuationScript(t: *TestServer, io: Io) void {
+    var seen: [1]u8 = undefined;
+    const acc = t.accept(io, "-", &seen) catch return;
+    defer acc.stream.close(io);
+    var wbuf: [64]u8 = undefined;
+    var w = acc.stream.writer(io, &wbuf);
+    testServerFrame(&w.interface, false, .text, "a") catch return;
+    // A continuation frame announcing 2^64 - 1 bytes.
+    w.interface.writeAll(&.{ 0x80, 127, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }) catch return;
+    w.interface.flush() catch return;
+    var rbuf: [256]u8 = undefined;
+    var r = acc.stream.reader(io, &rbuf);
+    _ = r.interface.discardRemaining() catch {};
+}
+
+test "an oversized frame length is rejected, not added up" {
+    const io = testing.io;
+    var t: TestServer = try .init(io);
+    defer t.deinit(io);
+    var task = try io.concurrent(hugeContinuationScript, .{ &t, io });
+    defer task.cancel(io);
+
+    var http: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer http.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/", .{t.port()});
+    var s = try Socket.connect(io, &http, url, &.{});
+    defer s.deinit();
+    try testing.expectError(error.MessageTooLarge, s.receive(testing.allocator));
 }
