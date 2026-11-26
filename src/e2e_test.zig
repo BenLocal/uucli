@@ -94,6 +94,8 @@ const Host = struct {
     serve: []const u8 = "",
     dl_task: u64 = 0,
     dl_acks: usize = 0,
+    /// Download blocks numbered from 1 and sent in order, as the official Windows host does.
+    dl_official: bool = false,
     dl_req: u64 = 5000,
 
     fn hasDc(h: *const Host, dc: c_int) bool {
@@ -397,14 +399,15 @@ const Host = struct {
     fn handleFtpResponse(h: *Host, dc: c_int, cases: []const u8) !void {
         if (wire.blob(cases, 3)) |r| {
             try testing.expectEqual(@as(u64, 1), wire.uint(r, 3));
-            // Blocks 0.. sent in reverse order (our host may reorder within its window).
-            var i = h.dlBlocks();
-            while (i > 0) {
-                i -= 1;
+            // Blocks 0.. sent in reverse order (our host may reorder within its window), or
+            // blocks 1.. in order like the official host.
+            const n = h.dlBlocks();
+            for (0..n) |k| {
+                const i = if (h.dl_official) k else n - 1 - k;
                 const chunk = h.serve[i * dl_block .. @min(h.serve.len, (i + 1) * dl_block)];
                 var b = try idOf(h.gpa, h.dl_task, 1);
                 defer b.deinit();
-                try b.int(2, i);
+                try b.int(2, i + @intFromBool(h.dl_official));
                 try b.bytes(3, chunk);
                 h.dl_req += 1;
                 try h.rpcSend(dc, h.dl_req, false, 4, b.buf.items);
@@ -1202,6 +1205,35 @@ test "files end to end through a fake host" {
     const got = try tmp.dir.readFileAlloc(io, "big.bin", gpa, .limited(1 << 20));
     defer gpa.free(got);
     try testing.expectEqualSlices(u8, content, got);
+
+    // 21 blocks in reverse order: more than 16 arrive before blocks 0 and 1.
+    const many = try gpa.alloc(u8, 20 * 32 * 1024 + 500);
+    defer gpa.free(many);
+    for (many, 0..) |*b, i| b.* = @truncate(i *% 13 +% 1);
+    env.host.serve = many;
+    {
+        const out = try tmp.dir.createFile(io, "many.bin", .{ .read = true });
+        defer out.close(io);
+        try f.download("/dir/many.bin", out);
+    }
+    const got_many = try tmp.dir.readFileAlloc(io, "many.bin", gpa, .limited(1 << 20));
+    defer gpa.free(got_many);
+    try testing.expectEqualSlices(u8, many, got_many);
+
+    // 40 blocks numbered from 1 in order: the base is fixed when the buffer fills up.
+    const official = try gpa.alloc(u8, 40 * 32 * 1024);
+    defer gpa.free(official);
+    for (official, 0..) |*b, i| b.* = @truncate(i *% 5 +% 9);
+    env.host.serve = official;
+    env.host.dl_official = true;
+    {
+        const out = try tmp.dir.createFile(io, "official.bin", .{ .read = true });
+        defer out.close(io);
+        try f.download("/dir/official.bin", out);
+    }
+    const got_official = try tmp.dir.readFileAlloc(io, "official.bin", gpa, .limited(2 << 20));
+    defer gpa.free(got_official);
+    try testing.expectEqualSlices(u8, official, got_official);
 
     env.bus.put(.interrupt);
     try testing.expectEqual(session.End.interrupted, try run_task.await(io));

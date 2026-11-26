@@ -943,7 +943,9 @@ counter starting at 100. Result codes: 1 = success, anything else → exit 6 wit
   - 3 open `ID(t,1)`, 3 size → 3: `ID`, 3 code (size must match the list; only index 1).
   - 4 block `ID(t,1)`, 2 block, 3 bytes (≤ 256 KiB) → 4: `ID`, 2 block, 3 code, 4 length. Blocks may
     arrive out of order; up to 32 are buffered. The first block id is 0 (our host) or 1 (official
-    Windows host): the base is fixed when block 0 arrives or 16 blocks are buffered.
+    Windows host): the base is 0 once block 0 arrives, and 1 when 32 blocks including block 1 are
+    buffered without block 0 (or at the finish request). It is never guessed from the lowest id
+    seen, because a reordering host may still send lower ones.
   - 9 finish `ID(t,1)`, 2 status → 6: `ID`, 2 code (status 1, all bytes written).
   - 9 with index 2^64−1 ends the task: status must be 1 and the file complete.
 - `put` without `--force` lists the remote directory first and refuses an existing name (exit 2).

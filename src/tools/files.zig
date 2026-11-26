@@ -21,6 +21,8 @@ const upload_block = 32 * 1024;
 /// Our host sends 32 KiB blocks; the official Windows host larger ones, bounded by the SCTP limit.
 const max_block = 256 * 1024;
 const max_list = 16 * 1024 * 1024;
+/// Download blocks buffered until they can be written in order.
+const max_pending = 32;
 const reply_timeout: Io.Duration = .fromSeconds(30);
 
 pub const Entry = struct { kind: u64, name: []const u8, size: u64, modified: u64, path: []const u8 };
@@ -477,14 +479,17 @@ pub const Files = struct {
                     const blockn = wire.uint(body, 2);
                     const chunk = wire.blob(body, 3) orelse "";
                     if (index != 1 or !opened or chunk.len > max_block or (next != null and blockn < next.?) or
-                        pending.contains(blockn) or pending.count() >= 32)
+                        pending.contains(blockn) or pending.count() >= max_pending)
                     {
                         code = 3;
                     } else {
                         try pending.put(f.gpa, blockn, try f.gpa.dupe(u8, chunk));
-                        // Block ids start at 1 (official host) or 0 (ours, out of order in a window of
-                        // 16): the base is fixed when block 0 arrives or 16 blocks are buffered.
-                        if (next == null and (blockn == 0 or pending.count() >= 16)) next = minKey(&pending);
+                        // Block ids start at 1 (official host) or 0 (ours, out of order): the base
+                        // is 0 once block 0 arrives, and 1 only when the buffer filled up without it.
+                        // Never the lowest id seen so far: a reordering host may still send lower ones.
+                        if (next == null) {
+                            if (blockn == 0) next = 0 else if (pending.count() == max_pending and pending.contains(1)) next = 1;
+                        }
                         if (!(try flushBlocks(f, &w.interface, &pending, &next, &written, size))) code = 6;
                     }
                     try reply.int(2, blockn);
