@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Starts the shared background connection and connects local stream and lease clients.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const session = @import("session.zig");
 const interrupts = @import("interrupts.zig");
@@ -14,9 +15,9 @@ const Exit = app_mod.Exit;
 const interruptedExit = app_mod.interruptedExit;
 const DeviceArg = target_mod.DeviceArg;
 
-/// Unix sockets exist, and `UUCLI_MUX` is not 0/false/no/off.
+/// Unix sockets exist, not on Windows, and `UUCLI_MUX` is not 0/false/no/off.
 pub fn muxEnabled(app: *App) bool {
-    if (!Io.net.has_unix_sockets) return false;
+    if (builtin.os.tag == .windows or !Io.net.has_unix_sockets) return false;
     const v = app.env.get("UUCLI_MUX") orelse return true;
     const t = std.mem.trim(u8, v, " ");
     for ([_][]const u8{ "0", "false", "no", "off" }) |no| if (std.ascii.eqlIgnoreCase(t, no)) return false;
@@ -26,6 +27,7 @@ pub fn muxEnabled(app: *App) bool {
 /// `proxy` through the shared session of DEVICE, starting it when needed. Null: not possible here
 /// (socket path too long), connect directly instead.
 pub fn proxyViaMux(app: *App, dev: DeviceArg, assist_code: ?[]const u8, host: []const u8, port: u16) !?Exit {
+    if (builtin.os.tag == .windows) return null;
     const cfg_path = try app.configPath();
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch {
@@ -200,6 +202,7 @@ fn copyAll(r: *Io.Reader, w: *Io.Writer) Io.Writer.Error!void {
 /// `portmap` through the shared session of DEVICE: each accepted connection asks the session for
 /// a stream (spec §7.2), starting the server when needed. Runs until SIGINT/SIGTERM.
 pub fn portmapViaMux(app: *App, dev: DeviceArg, code: ?[]const u8, pm: *portmap.PortMap) !?Exit {
+    if (builtin.os.tag == .windows) return null;
     const io = app.io;
     const cfg_path = try app.configPath();
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -294,6 +297,7 @@ const MuxForwards = struct {
 /// another client started one meanwhile); else the exit code, with the server's messages relayed.
 /// `code`: an assistance code the server cannot find itself (asked for on the terminal).
 pub fn startMuxServer(app: *App, cfg_path: []const u8, dev: DeviceArg, sock: []const u8, code: ?[]const u8) !?Exit {
+    if (builtin.os.tag == .windows) return app.fail(.other, "shared connections are not supported on Windows", .{});
     const io = app.io;
     const cwd = Io.Dir.cwd();
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -368,6 +372,7 @@ pub const MuxLease = struct { conn: Io.net.Stream, platform: i64 };
 /// Asks the shared session at `sock` for a lease; waits while another client holds it. `gone`: no
 /// server, or it closed before answering.
 pub fn muxLease(io: Io, sock: []const u8) !union(enum) { granted: MuxLease, gone, unsupported } {
+    if (builtin.os.tag == .windows) return .unsupported;
     const conn = (try Io.net.UnixAddress.init(sock)).connect(io) catch |err| switch (err) {
         error.FileNotFound, error.ConnectionRefused => return .gone,
         else => |e| return e,

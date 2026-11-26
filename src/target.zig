@@ -95,7 +95,7 @@ pub fn readCode(app: *App, id: []const u8, stdin_free: bool) ![]const u8 {
     if (is_tty) {
         try app.err.print("Code for {s}: ", .{id});
         try app.err.flush();
-        echo = tty.Raw.noEcho(0) catch null;
+        echo = tty.Raw.noEcho(Io.File.stdin().handle) catch null;
     }
     // One byte at a time: nothing after the line is consumed.
     var buf: [1]u8 = undefined;

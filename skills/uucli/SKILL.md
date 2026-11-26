@@ -141,7 +141,7 @@ uucli session status office-pc --json
 uucli session stop office-pc
 ```
 
-By default, shared connections close after 60 seconds of inactivity.
+By default, shared connections close after 600 seconds (10 minutes) of inactivity.
 `session start` opens or reuses one and keeps it open until it is stopped or the
 connection ends. Each `exec` still opens a fresh remote shell. `session list`
 and `session status` inspect local connections, including stream and waiting

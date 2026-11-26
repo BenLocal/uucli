@@ -1,6 +1,7 @@
 # uucli
 
-A headless command-line client for NetEase UU Remote (网易UU远程), for Linux and macOS. It signs in
+A headless command-line client for NetEase UU Remote (网易UU远程), for Linux, macOS, and Windows
+(direct connections; shared `session`/`__mux` connections are Linux/macOS only). It signs in
 to your own UU account with a QR code and reaches the hosts bound to that account, or a host that
 offers remote assistance by share id and code: TCP port forwarding (for example as an SSH tunnel),
 a remote terminal, and file transfer.
@@ -20,6 +21,7 @@ linked statically.
 zig build -Doptimize=ReleaseSafe             # zig-out/bin/uucli
 zig build -Doptimize=ReleaseSafe -p ~/.local # install to ~/.local/bin/uucli (-p = --prefix)
 zig build -Dtarget=x86_64-linux-musl         # static Linux binary
+zig build -Dtarget=x86_64-windows-gnu        # Windows binary (zig-out/bin/uucli.exe)
 zig build test                               # offline tests, no account needed
 zig build release                            # zig-out/release/uucli-VERSION-ARCH-OS.tar.gz
 ```
@@ -76,7 +78,7 @@ Host office
 ```
 
 A host accepts one connection at a time, so every command for one device shares a single
-connection, kept by a background `uucli` process that exits 60 s after its last user
+connection, kept by a background `uucli` process that exits 600 s after its last user
 (`UUCLI_MUX_IDLE=SECONDS` to change) and is started again on demand. `proxy` and `portmap` streams
 run in parallel, also to different machines behind the same host; `terminal`, `exec` and `files`
 take turns (one at a time per device, the others wait) while the streams keep running. `--no-mux`

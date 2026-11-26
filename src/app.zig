@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared CLI context, configuration errors, exit codes and output helpers.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const config = @import("config.zig");
@@ -115,7 +116,10 @@ pub fn errorExit(app: *App, err: anyerror) Exit {
         error.ReportedNotSignedIn => .not_signed_in,
         error.ReportedNoDevice => .no_device,
         error.NotSignedIn => app.fail(.not_signed_in, "Not signed in or the login expired: run `uucli login`", .{}),
-        error.NoConfigPath => app.fail(.other, "cannot locate the config: set HOME or UUCLI_CONFIG", .{}),
+        error.NoConfigPath => app.fail(.other, if (builtin.os.tag == .windows)
+            "cannot locate the config: set APPDATA, USERPROFILE or UUCLI_CONFIG"
+        else
+            "cannot locate the config: set HOME or UUCLI_CONFIG", .{}),
         error.Canceled => .interrupted,
         else => app.fail(.other, "error: {t}", .{err}),
     };

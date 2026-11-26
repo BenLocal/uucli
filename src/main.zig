@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Process initialization, global options, fixed aliases and command dispatch (spec §3).
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const build_options = @import("build_options");
 const app_mod = @import("app.zig");
+const tty = @import("tty.zig");
 const App = app_mod.App;
 const Exit = app_mod.Exit;
 const usage = app_mod.usage;
@@ -71,11 +73,17 @@ const usage_text =
     \\
     \\Environment: UUCLI_CONFIG (config file), UUCLI_USE_PROXY=1 (honor HTTP(S)_PROXY),
     \\  UUCLI_ASSIST_CODE (remote-assistance code), UUCLI_MUX=0 (no shared connection),
-    \\  UUCLI_MUX_IDLE (idle seconds for automatic connections, default 60)
+    \\  UUCLI_MUX_IDLE (idle seconds for automatic connections, default 600)
     \\
 ;
 
+extern fn uucli_mbedtls_init_threading() callconv(.c) void;
+
 pub fn main(init: std.process.Init) u8 {
+    if (builtin.os.tag == .windows) {
+        tty.initConsole();
+        uucli_mbedtls_init_threading();
+    }
     @import("interrupts.zig").ignoreBrokenPipe();
     var out_buf: [4096]u8 = undefined;
     var err_buf: [1024]u8 = undefined;

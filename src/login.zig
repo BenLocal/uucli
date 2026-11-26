@@ -501,8 +501,15 @@ fn sysctlString(arena: Allocator, name: [:0]const u8) []const u8 {
 
 /// The machine fields of `device/windows/init` (spec §5.2).
 pub fn hardware(arena: Allocator, io: Io) !Hardware {
-    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    var host: []const u8 = std.posix.gethostname(&host_buf) catch "unknown";
+    var host_buf: [256]u8 = undefined;
+    var host: []const u8 = if (builtin.os.tag == .windows)
+        windowsHostName(&host_buf)
+    else blk: {
+        var posix_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const name = std.posix.gethostname(&posix_buf) catch break :blk "unknown";
+        @memcpy(host_buf[0..name.len], name);
+        break :blk host_buf[0..name.len];
+    };
     // gethostname on macOS often returns a DHCP-assigned name or address; prefer the Bonjour name.
     if (builtin.os.tag.isDarwin()) {
         const local = runOutput(arena, io, &.{ "/usr/sbin/scutil", "--get", "LocalHostName" });
@@ -539,9 +546,43 @@ pub fn hardware(arena: Allocator, io: Io) !Hardware {
         var mem: u64 = 0;
         var len: usize = @sizeOf(u64);
         if (std.c.sysctlbyname("hw.memsize", &mem, &len, null, 0) == 0) h.memory_mib = mem / (1024 * 1024);
-        h.mac = darwinMac(arena);
+        h.mac = Darwin.mac(arena);
+    } else if (builtin.os.tag == .windows) {
+        h.os = "Windows";
+        h.cpu = @tagName(builtin.cpu.arch);
+        h.memory_mib = windowsMemoryMib();
     }
     return h;
+}
+
+const Win32 = struct {
+    const MEMORYSTATUSEX = extern struct {
+        dwLength: std.os.windows.DWORD,
+        dwMemoryLoad: std.os.windows.DWORD,
+        ullTotalPhys: u64,
+        ullAvailPhys: u64,
+        ullTotalPageFile: u64,
+        ullAvailPageFile: u64,
+        ullTotalVirtual: u64,
+        ullAvailVirtual: u64,
+        ullAvailExtendedVirtual: u64,
+    };
+
+    extern "kernel32" fn GetComputerNameA(lpBuffer: [*]u8, nSize: *std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+    extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) callconv(.winapi) std.os.windows.BOOL;
+};
+
+fn windowsHostName(buf: *[256]u8) []const u8 {
+    var size: std.os.windows.DWORD = @intCast(buf.len);
+    if (Win32.GetComputerNameA(buf, &size) == .FALSE or size == 0) return "unknown";
+    return buf[0..size];
+}
+
+fn windowsMemoryMib() u64 {
+    var status: Win32.MEMORYSTATUSEX = std.mem.zeroes(Win32.MEMORYSTATUSEX);
+    status.dwLength = @sizeOf(Win32.MEMORYSTATUSEX);
+    if (Win32.GlobalMemoryStatusEx(&status) == .FALSE) return 0;
+    return status.ullTotalPhys / (1024 * 1024);
 }
 
 /// Uppercase dash form, e.g. `AA-BB-CC-DD-EE-FF`.
@@ -581,46 +622,48 @@ fn linuxMac(arena: Allocator, io: Io) ![]const u8 {
     return "";
 }
 
-const ifaddrs = extern struct {
-    next: ?*ifaddrs,
-    name: [*:0]const u8,
-    flags: c_uint,
-    addr: ?*const std.c.sockaddr,
-    netmask: ?*const std.c.sockaddr,
-    dstaddr: ?*const std.c.sockaddr,
-    data: ?*anyopaque,
-};
-extern "c" fn getifaddrs(out: *?*ifaddrs) c_int;
-extern "c" fn freeifaddrs(list: ?*ifaddrs) void;
+const Darwin = struct {
+    const ifaddrs = extern struct {
+        next: ?*ifaddrs,
+        name: [*:0]const u8,
+        flags: c_uint,
+        addr: ?*const std.c.sockaddr,
+        netmask: ?*const std.c.sockaddr,
+        dstaddr: ?*const std.c.sockaddr,
+        data: ?*anyopaque,
+    };
+    extern "c" fn getifaddrs(out: *?*ifaddrs) c_int;
+    extern "c" fn freeifaddrs(list: ?*ifaddrs) void;
 
-/// First Ethernet-type link address among `en*` interfaces, sorted by name.
-fn darwinMac(arena: Allocator) []const u8 {
-    var list: ?*ifaddrs = null;
-    if (getifaddrs(&list) != 0) return "";
-    defer freeifaddrs(list);
-    var best_name: []const u8 = "";
-    var best: [6]u8 = undefined;
-    var it = list;
-    while (it) |ifa| : (it = ifa.next) {
-        const sa = ifa.addr orelse continue;
-        const AF_LINK = 18;
-        if (sa.family != AF_LINK) continue;
-        // struct sockaddr_dl: len, family, index(2), type, nlen, alen, slen, data[]
-        const raw: [*]const u8 = @ptrCast(sa);
-        const ift_ether = 6;
-        if (raw[4] != ift_ether or raw[6] != 6) continue;
-        const name = std.mem.span(ifa.name);
-        if (!std.mem.startsWith(u8, name, "en")) continue;
-        const addr = raw[8 + raw[5] ..][0..6];
-        if (std.mem.allEqual(u8, addr, 0)) continue;
-        if (best_name.len == 0 or std.mem.lessThan(u8, name, best_name)) {
-            best_name = name;
-            best = addr.*;
+    /// First Ethernet-type link address among `en*` interfaces, sorted by name.
+    fn mac(arena: Allocator) []const u8 {
+        var list: ?*ifaddrs = null;
+        if (getifaddrs(&list) != 0) return "";
+        defer freeifaddrs(list);
+        var best_name: []const u8 = "";
+        var best: [6]u8 = undefined;
+        var it = list;
+        while (it) |ifa| : (it = ifa.next) {
+            const sa = ifa.addr orelse continue;
+            const AF_LINK = 18;
+            if (sa.family != AF_LINK) continue;
+            // struct sockaddr_dl: len, family, index(2), type, nlen, alen, slen, data[]
+            const raw: [*]const u8 = @ptrCast(sa);
+            const ift_ether = 6;
+            if (raw[4] != ift_ether or raw[6] != 6) continue;
+            const name = std.mem.span(ifa.name);
+            if (!std.mem.startsWith(u8, name, "en")) continue;
+            const addr = raw[8 + raw[5] ..][0..6];
+            if (std.mem.allEqual(u8, addr, 0)) continue;
+            if (best_name.len == 0 or std.mem.lessThan(u8, name, best_name)) {
+                best_name = name;
+                best = addr.*;
+            }
         }
+        if (best_name.len == 0) return "";
+        return formatMac(arena, &best) catch "";
     }
-    if (best_name.len == 0) return "";
-    return formatMac(arena, &best) catch "";
-}
+};
 
 const testing = std.testing;
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const config = @import("../config.zig");
 const api = @import("../api.zig");
@@ -117,6 +118,7 @@ fn keepSession(app: *App, sock: []const u8) !Exit {
 }
 
 pub fn run(app: *App, args: []const [:0]const u8) !Exit {
+    if (builtin.os.tag == .windows) return app.fail(.other, "shared connections are not supported on Windows", .{});
     if (args.len == 0) return usage(app, "expected session start|list|status|stop", .{});
     const action = args[0];
     const list = eql(action, "list") or eql(action, "ls");
@@ -195,6 +197,7 @@ pub fn run(app: *App, args: []const [:0]const u8) !Exit {
 }
 
 test "session commands use live local status, isolate configs and ignore stale sockets" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const t = std.testing;
     const io = t.io;
     var arena: std.heap.ArenaAllocator = .init(t.allocator);

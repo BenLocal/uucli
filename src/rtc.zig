@@ -3,8 +3,11 @@
 //! every callback copies its data into an `Event` and pushes it onto `Hub.queue`, which the
 //! program's own tasks drain through `std.Io`.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 const Io = std.Io;
+
+extern fn uucli_mbedtls_init_threading() callconv(.c) void;
 
 /// Heap for event payloads; must be usable from libdatachannel's threads.
 const heap = std.heap.c_allocator;
@@ -85,6 +88,7 @@ var hub_ready = false;
 /// Returns the process-wide hub, creating it on first use (or again after `shutdown`, for tests
 /// that run several sessions). Not thread-safe; call from main first.
 pub fn globalHub(io: Io) *Hub {
+    if (builtin.os.tag == .windows) uucli_mbedtls_init_threading();
     if (!hub_ready or hub_storage.closing.load(.seq_cst)) {
         hub_storage = .{ .io = io, .queue = .init(&hub_buffer) };
         hub_ready = true;

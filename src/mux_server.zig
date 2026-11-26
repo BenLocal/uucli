@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Internal __mux server: opens the remote connection and serves local clients.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const config = @import("config.zig");
 const api = @import("api.zig");
@@ -23,17 +24,25 @@ const DeviceArg = target_mod.DeviceArg;
 const resolveTarget = target_mod.resolveTarget;
 const openFailure = runner.openFailure;
 
+const default_idle_seconds: u32 = 600;
+
+fn idleSeconds(env: *const std.process.Environ.Map) u32 {
+    const v = env.get("UUCLI_MUX_IDLE") orelse return default_idle_seconds;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch default_idle_seconds;
+}
+
 /// Internal (`uucli __mux [--assist] DEVICE`): one port mapping session for every `proxy` of
 /// DEVICE (spec §7.2). Prints `ready` on stdout once clients can connect; messages go to stderr
-/// (the mux log file). Automatic connections expire after `UUCLI_MUX_IDLE` seconds (default 60)
+/// (the mux log file). Automatic connections expire after `UUCLI_MUX_IDLE` seconds (default 600)
 /// without streams or leases; kept connections skip idle expiry. All end on loss or SIGINT/SIGTERM.
 pub fn run(app: *App, all_args: []const [:0]const u8) !Exit {
+    if (builtin.os.tag == .windows) return app.fail(.other, "shared connections are not supported on Windows", .{});
     const io = app.io;
     const assist = all_args.len != 0 and eql(all_args[0], "--assist");
     const args = if (assist) all_args[1..] else all_args;
     if (args.len != 1) return usage(app, "expected `__mux [--assist] DEVICE`", .{});
     const dev: DeviceArg = .{ .query = args[0], .assist = assist };
-    const idle: Io.Duration = .fromSeconds(if (app.env.get("UUCLI_MUX_IDLE")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 60 else 60);
+    const idle: Io.Duration = .fromSeconds(idleSeconds(app.env));
     const cfg_path = try app.configPath();
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock = mux.path(&sock_buf, cfg_path, dev.assist, dev.query, .sock) catch
@@ -120,4 +129,17 @@ fn muxIdleWatch(control: *mux.Control, idle: Io.Duration) Io.Cancelable!void {
         try control.io.sleep(.fromSeconds(1), .awake);
         if (control.expire(&since, idle)) return;
     }
+}
+
+test "idleSeconds defaults to 600 and honors UUCLI_MUX_IDLE" {
+    const t = std.testing;
+    var env: std.process.Environ.Map = .init(t.allocator);
+    defer env.deinit();
+    try t.expectEqual(@as(u32, 600), idleSeconds(&env));
+    try env.put("UUCLI_MUX_IDLE", "120");
+    try t.expectEqual(@as(u32, 120), idleSeconds(&env));
+    try env.put("UUCLI_MUX_IDLE", " 30 ");
+    try t.expectEqual(@as(u32, 30), idleSeconds(&env));
+    try env.put("UUCLI_MUX_IDLE", "bad");
+    try t.expectEqual(@as(u32, 600), idleSeconds(&env));
 }

@@ -2,8 +2,8 @@
 
 ## 1. Goal
 
-uucli is a headless UU Remote (网易UU远程) **controller** CLI written in Zig. It runs on Linux and macOS,
-signs in with a UU account, and gives the user, against a device bound to that account or a host
+uucli is a headless UU Remote (网易UU远程) **controller** CLI written in Zig. It runs on Linux,
+macOS, and Windows (direct connections; shared mux sessions are Linux/macOS only), signs in with a UU account, and gives the user, against a device bound to that account or a host
 that offers remote assistance (share id and code, §5.5):
 
 - a TCP port forward (`portmap`, `proxy`), so ssh / scp / rsync / VS Code Remote work over UU Remote;
@@ -11,7 +11,7 @@ that offers remote assistance (share id and code, §5.5):
 - single-file transfer (`files`).
 
 Non-goals: remote desktop, audio/video, clipboard, gamepad, any GUI, acting as a controlled host
-(including offering remote assistance), Windows as the uucli platform.
+(including offering remote assistance).
 
 ## 2. Fixed decisions
 
@@ -139,8 +139,8 @@ Host office-pc
 
 | Item | Value |
 | --- | --- |
-| Path | `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `~/.config/uucli/config.json` (macOS too) |
-| Permissions | file `0600`, directory `0700`; uucli refuses to read a config readable by group/other and says how to fix it |
+| Path | `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `%APPDATA%/uucli/config.json` or `%USERPROFILE%/.config/uucli/config.json` on Windows, else `~/.config/uucli/config.json` (macOS too) |
+| Permissions | file `0600`, directory `0700` on Linux/macOS; uucli refuses to read a config readable by group/other and says how to fix it (skipped on Windows) |
 | Writes | write `config.json.tmp` (0600) → fsync → rename |
 | Locking | Lock files are named after the config file's stem (`config.json` → `config.lock`, `config.login.lock`). Blocking `flock` on `STEM.lock` around device registration and login (and `logout`, and saving codes in `fav add` / `fav rm`), so two processes cannot register two devices |
 
@@ -619,7 +619,7 @@ process (internal command; not a stable interface).
 - The server opens the session like `portmap` (capture type 9) but does not reconnect: when the
   session ends it removes the socket file and exits, closing its streams; the next `proxy` starts
   a new one. Unless explicitly kept by `session start` (§7.4), it also ends after `UUCLI_MUX_IDLE`
-  seconds (default 60) without port streams or active / waiting leases. All shared connections
+  seconds (default 600) without port streams or active / waiting leases. All shared connections
   end on SIGINT / SIGTERM. The socket file is removed before the listener closes.
 - An assistance code comes from `UUCLI_ASSIST_CODE` (inherited) or the config; the server never
   prompts.
@@ -957,12 +957,13 @@ counter starting at 100. Result codes: 1 = success, anything else → exit 6 wit
 ### 11.3 Packaging (M5)
 
 - `zig build release` builds ReleaseSafe, stripped binaries for x86_64 / aarch64 Linux (musl, fully
-  static) and x86_64 / aarch64 macOS (libSystem only) and writes
-  `zig-out/release/uucli-VERSION-ARCH-OS.tar.gz`, each with `uucli`, README, LICENSE, NOTICE and the
+  static), x86_64 / aarch64 macOS (libSystem only), and x86_64 Windows (`x86_64-windows-gnu`), and writes
+  `zig-out/release/uucli-VERSION-ARCH-OS.tar.gz`, each with `uucli` (or `uucli.exe`), README, LICENSE, NOTICE, and (for Linux/macOS) the
   systemd unit. The macOS targets need a macOS host with the SDK (usrsctp uses SDK-only headers).
-  `-Drelease-os=linux` or `macos` builds only that OS's archives.
+  `-Drelease-os=linux`, `macos`, or `windows` builds only that OS's archives.
 - GitHub Actions: `ci.yml` (every push and pull request) runs `zig fmt --check`, the SPDX header
-  check, build + tests on Ubuntu and macOS, and an aarch64-linux-musl cross build. `release.yml`
+  check, build + unit/e2e tests + CLI smoke checks on Ubuntu, macOS, and Windows, and
+  `aarch64-linux-musl` / `x86_64-windows-gnu` cross-builds. `release.yml`
   runs for a pushed tag `vVERSION` that equals `build.zig`'s version: Linux archives on Ubuntu, macOS
   archives on a macOS runner (best effort: a failure does not hold back the Linux release), then a
   GitHub release with the archives and `SHA256SUMS`.

@@ -124,7 +124,7 @@ fn terminalAttach(app: *App, cmd: *TerminalCmd, group: *Io.Group, want: u32) Exi
     const id = t.open(app.arena, want, sz[0], sz[1]) catch |err| return terminalError(app, err);
     log.info("attached to terminal session {d}", .{id});
     var raw: ?tty.Raw = null;
-    if (is_tty) raw = tty.Raw.enter(0) catch null;
+    if (is_tty) raw = tty.Raw.enter(Io.File.stdin().handle) catch null;
     var restored = false;
     const restore = struct {
         fn f(r: ?tty.Raw, done: *bool) void {

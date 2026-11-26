@@ -21,14 +21,15 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run uucli").dependOn(&run_cmd.step);
 
     // Release archives (spec §11.3): zig-out/release/uucli-VERSION-ARCH-OS.tar.gz
-    const release = b.step("release", "Build static release archives for Linux and macOS");
+    const release = b.step("release", "Build static release archives for Linux, macOS and Windows");
     // CI builds Linux on a Linux runner and macOS on a macOS runner (the macOS targets need the SDK).
-    const release_os = b.option(std.Target.Os.Tag, "release-os", "Only build the release archives for this OS (linux, macos)");
+    const release_os = b.option(std.Target.Os.Tag, "release-os", "Only build the release archives for this OS (linux, macos, windows)");
     const release_targets = [_]std.Target.Query{
         .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
         .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
         .{ .cpu_arch = .x86_64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
     };
     for (release_targets) |q| {
         if (release_os) |os| if (q.os_tag.? != os) continue;
@@ -37,9 +38,12 @@ pub fn build(b: *std.Build) void {
         const rexe = addUucli(b, t, .ReleaseSafe, false);
         rexe.root_module.strip = true;
         const stage = b.addWriteFiles();
-        _ = stage.addCopyFile(rexe.getEmittedBin(), b.fmt("{s}/uucli", .{name}));
-        for ([_][]const u8{ "README.md", "LICENSE", "NOTICE", "contrib/systemd/uucli-portmap@.service" }) |f|
+        const bin_name = if (q.os_tag.? == .windows) "uucli.exe" else "uucli";
+        _ = stage.addCopyFile(rexe.getEmittedBin(), b.fmt("{s}/{s}", .{ name, bin_name }));
+        for ([_][]const u8{ "README.md", "LICENSE", "NOTICE" }) |f|
             _ = stage.addCopyFile(b.path(f), b.fmt("{s}/{s}", .{ name, f }));
+        if (q.os_tag.? != .windows)
+            _ = stage.addCopyFile(b.path("contrib/systemd/uucli-portmap@.service"), b.fmt("{s}/contrib/systemd/uucli-portmap@.service", .{name}));
         const tar = b.addSystemCommand(&.{ "tar", "-C" });
         tar.addDirectoryArg(stage.getDirectory());
         tar.addArg("-czf");
@@ -52,6 +56,7 @@ pub fn build(b: *std.Build) void {
     const filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this") orelse &.{};
     const tests = b.addTest(.{ .root_module = exe.root_module, .filters = filters });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    b.step("test-build", "Compile unit and e2e tests without running").dependOn(&tests.step);
 }
 
 fn addUucli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, system_libdatachannel: bool) *std.Build.Step.Compile {
@@ -107,19 +112,31 @@ fn linkNative(
     tls.root_module.addIncludePath(tls_dep.path("library"));
     tls.root_module.addIncludePath(b.path("vendor/mbedtls"));
     tls.root_module.addCMacro("MBEDTLS_USER_CONFIG_FILE", "\"uucli_mbedtls_config.h\"");
+    if (os == .windows) {
+        tls.root_module.addCSourceFile(.{ .file = b.path("vendor/mbedtls/threading_win32.c"), .flags = quiet });
+        tls.root_module.linkSystemLibrary("ws2_32", .{});
+        tls.root_module.linkSystemLibrary("bcrypt", .{});
+    }
 
     // usrsctp (no INET/INET6: libdatachannel only uses AF_CONN)
     const sctp = cLibrary(b, "usrsctp", target, optimize, sctp_dep.path("usrsctplib"), &usrsctp_sources, quiet);
     const sm = sctp.root_module;
     sm.addIncludePath(sctp_dep.path("usrsctplib"));
-    for ([_][]const u8{ "__Userspace__", "SCTP_SIMPLE_ALLOCATOR", "SCTP_PROCESS_LEVEL_LOCKS", "HAVE_STDATOMIC_H", "HAVE_NETINET_IP_ICMP_H", "HAVE_NET_ROUTE_H" }) |name| sm.addCMacro(name, "1");
+    for ([_][]const u8{ "__Userspace__", "SCTP_SIMPLE_ALLOCATOR", "SCTP_PROCESS_LEVEL_LOCKS", "HAVE_STDATOMIC_H" }) |name| sm.addCMacro(name, "1");
     switch (os) {
         .macos => {
-            for ([_][]const u8{ "__APPLE_USE_RFC_2292", "HAVE_SYS_QUEUE_H", "HAVE_SA_LEN", "HAVE_SIN_LEN", "HAVE_SIN6_LEN", "HAVE_SCONN_LEN" }) |name| sm.addCMacro(name, "1");
+            for ([_][]const u8{ "__APPLE_USE_RFC_2292", "HAVE_SYS_QUEUE_H", "HAVE_SA_LEN", "HAVE_SIN_LEN", "HAVE_SIN6_LEN", "HAVE_SCONN_LEN", "HAVE_NETINET_IP_ICMP_H", "HAVE_NET_ROUTE_H" }) |name| sm.addCMacro(name, "1");
         },
         .linux => {
-            for ([_][]const u8{ "_GNU_SOURCE", "HAVE_LINUX_IF_ADDR_H", "HAVE_LINUX_RTNETLINK_H" }) |name| sm.addCMacro(name, "1");
+            for ([_][]const u8{ "_GNU_SOURCE", "HAVE_LINUX_IF_ADDR_H", "HAVE_LINUX_RTNETLINK_H", "HAVE_NETINET_IP_ICMP_H", "HAVE_NET_ROUTE_H" }) |name| sm.addCMacro(name, "1");
             if (!target.result.isMuslLibC()) sm.addCMacro("HAVE_SYS_QUEUE_H", "1");
+        },
+        .windows => {
+            sm.addCMacro("_WIN32_WINNT", "0x0601");
+            sm.addCMacro("__USE_MINGW_ANSI_STDIO", "1");
+            sm.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+            sm.linkSystemLibrary("ws2_32", .{});
+            sm.linkSystemLibrary("iphlpapi", .{});
         },
         else => {},
     }
@@ -134,6 +151,12 @@ fn linkNative(
     jm.addCMacro("JUICE_EXPORTS", "1");
     jm.addCMacro("USE_NETTLE", "0");
     jm.addCMacro("NO_SERVER", "1");
+    if (os == .windows) {
+        jm.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+        jm.addCMacro("_WIN32_WINNT", "0x0601");
+        jm.linkSystemLibrary("ws2_32", .{});
+        jm.linkSystemLibrary("bcrypt", .{});
+    }
 
     // libdatachannel (data channels only: no media, no WebSocket)
     const dc_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
@@ -163,6 +186,13 @@ fn linkNative(
     }) |d| dc_mod.addCMacro(d[0], d[1]);
     // usrsctp.h gives struct sockaddr_conn a length byte on BSD-style systems; libdatachannel must fill it.
     if (os.isDarwin()) dc_mod.addCMacro("HAVE_SCONN_LEN", "1");
+    if (os == .windows) {
+        dc_mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+        dc_mod.addCMacro("NOMINMAX", "1");
+        dc_mod.addCMacro("_WIN32_WINNT", "0x0601");
+        dc_mod.linkSystemLibrary("ws2_32", .{});
+        dc_mod.linkSystemLibrary("crypt32", .{});
+    }
     dc_mod.linkLibrary(juice);
     dc_mod.linkLibrary(sctp);
     dc_mod.linkLibrary(tls);
@@ -171,6 +201,12 @@ fn linkNative(
     m.link_libcpp = true;
     c.addIncludePath(dc_dep.path("include"));
     m.linkLibrary(dc);
+    if (os == .windows) {
+        m.linkSystemLibrary("ws2_32", .{});
+        m.linkSystemLibrary("iphlpapi", .{});
+        m.linkSystemLibrary("bcrypt", .{});
+        m.linkSystemLibrary("crypt32", .{});
+    }
 }
 
 /// An explicit macOS target (the release step) does not get the SDK headers a native build gets;

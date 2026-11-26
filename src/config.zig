@@ -2,9 +2,18 @@
 //! Config file (spec §4): path resolution, permission checks, atomic writes and locks.
 //! The file holds the login token: it is never logged and always kept at mode 0600.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Environ = std.process.Environ;
+
+const is_windows = builtin.os.tag == .windows;
+const private_file_perms: Io.File.Permissions = if (is_windows) .default_file else .fromMode(0o600);
+const private_dir_perms: Io.File.Permissions = if (is_windows) .default_dir else .fromMode(0o700);
+
+fn isInsecure(perms: Io.File.Permissions) bool {
+    return if (is_windows) false else (perms.toMode() & 0o077 != 0);
+}
 
 pub const Config = struct {
     client_id: []const u8 = "",
@@ -62,11 +71,18 @@ pub const Error = error{
     UnsupportedCodeFormat,
 };
 
-/// `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `~/.config/uucli/config.json`.
+/// `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `%APPDATA%/uucli/config.json`
+/// or `%USERPROFILE%/.config/uucli/config.json` on Windows, else `~/.config/uucli/config.json`.
 pub fn resolvePath(arena: Allocator, env: *const Environ.Map) (Error || Allocator.Error)![]const u8 {
     if (env.get("UUCLI_CONFIG")) |p| if (p.len != 0) return arena.dupe(u8, p);
     if (env.get("XDG_CONFIG_HOME")) |x| if (x.len != 0 and std.fs.path.isAbsolute(x))
         return std.fs.path.join(arena, &.{ x, "uucli", "config.json" });
+    if (is_windows) {
+        if (env.get("APPDATA")) |a| if (a.len != 0 and std.fs.path.isAbsolute(a))
+            return std.fs.path.join(arena, &.{ a, "uucli", "config.json" });
+        if (env.get("USERPROFILE")) |u| if (u.len != 0)
+            return std.fs.path.join(arena, &.{ u, ".config", "uucli", "config.json" });
+    }
     const home = env.get("HOME") orelse return error.NoConfigPath;
     if (home.len == 0) return error.NoConfigPath;
     return std.fs.path.join(arena, &.{ home, ".config", "uucli", "config.json" });
@@ -106,7 +122,7 @@ fn loadStored(arena: Allocator, io: Io, path: []const u8) !Config {
     };
     defer file.close(io);
     const st = try file.stat(io);
-    if (st.permissions.toMode() & 0o077 != 0) return error.InsecurePermissions;
+    if (isInsecure(st.permissions)) return error.InsecurePermissions;
     var buf: [4096]u8 = undefined;
     var r = file.reader(io, &buf);
     const bytes = r.interface.allocRemaining(arena, .limited(max_size)) catch |err| switch (err) {
@@ -134,7 +150,7 @@ fn decryptCodes(arena: Allocator, io: Io, path: []const u8, cfg: *Config) !void 
 /// Writes `PATH.tmp` (0600), syncs it and renames it over `path`. Creates the directory (0700).
 pub fn save(io: Io, path: []const u8, cfg: Config) !void {
     const cwd = Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |dir| _ = try cwd.createDirPathStatus(io, dir, .fromMode(0o700));
+    if (std.fs.path.dirname(path)) |dir| _ = try cwd.createDirPathStatus(io, dir, private_dir_perms);
 
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -150,10 +166,10 @@ pub fn save(io: Io, path: []const u8, cfg: Config) !void {
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
     {
-        const file = try cwd.createFile(io, tmp, .{ .permissions = .fromMode(0o600) });
+        const file = try cwd.createFile(io, tmp, .{ .permissions = private_file_perms });
         defer file.close(io);
         // An older tmp file may exist with other permissions.
-        try file.setPermissions(io, .fromMode(0o600));
+        if (!is_windows) try file.setPermissions(io, private_file_perms);
         var buf: [1024]u8 = undefined;
         var w = file.writer(io, &buf);
         writeJson(&w.interface, stored) catch return w.err.?;
@@ -179,7 +195,7 @@ fn encryptionKey(io: Io, path: []const u8, create: bool) ![Cipher.key_length]u8 
             defer std.crypto.secureZero(u8, &key);
             const out = cwd.createFile(io, key_path, .{
                 .exclusive = true,
-                .permissions = .fromMode(0o600),
+                .permissions = private_file_perms,
             }) catch |e| switch (e) {
                 error.PathAlreadyExists => return encryptionKey(io, path, false),
                 else => return e,
@@ -195,7 +211,7 @@ fn encryptionKey(io: Io, path: []const u8, create: bool) ![Cipher.key_length]u8 
     };
     defer file.close(io);
     const st = try file.stat(io);
-    if (st.permissions.toMode() & 0o077 != 0 or st.size != Cipher.key_length)
+    if (isInsecure(st.permissions) or st.size != Cipher.key_length)
         return error.InvalidEncryptionKey;
     var key: [Cipher.key_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
@@ -277,14 +293,14 @@ pub fn lockPath(buf: []u8, path: []const u8, kind: LockKind) ![]const u8 {
 
 pub fn lock(io: Io, path: []const u8, kind: LockKind) !Lock {
     const cwd = Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |dir| _ = try cwd.createDirPathStatus(io, dir, .fromMode(0o700));
+    if (std.fs.path.dirname(path)) |dir| _ = try cwd.createDirPathStatus(io, dir, private_dir_perms);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const p = try lockPath(&buf, path, kind);
     const file = cwd.createFile(io, p, .{
         .truncate = false,
         .lock = .exclusive,
         .lock_nonblocking = kind == .login,
-        .permissions = .fromMode(0o600),
+        .permissions = private_file_perms,
     }) catch |err| switch (err) {
         error.WouldBlock => return error.Busy,
         else => |e| return e,
@@ -306,14 +322,29 @@ test "resolvePath order" {
     var env: Environ.Map = .init(testing.allocator);
     defer env.deinit();
     try testing.expectError(error.NoConfigPath, resolvePath(arena, &env));
-    try env.put("HOME", "/home/u");
-    try testing.expectEqualStrings("/home/u/.config/uucli/config.json", try resolvePath(arena, &env));
-    try env.put("XDG_CONFIG_HOME", "relative");
-    try testing.expectEqualStrings("/home/u/.config/uucli/config.json", try resolvePath(arena, &env));
-    try env.put("XDG_CONFIG_HOME", "/x");
-    try testing.expectEqualStrings("/x/uucli/config.json", try resolvePath(arena, &env));
-    try env.put("UUCLI_CONFIG", "/y/work.json");
-    try testing.expectEqualStrings("/y/work.json", try resolvePath(arena, &env));
+    if (is_windows) {
+        try env.put("HOME", "C:\\home\\u");
+        try testing.expectEqualStrings("C:\\home\\u\\.config\\uucli\\config.json", try resolvePath(arena, &env));
+        try env.put("USERPROFILE", "C:\\Users\\u");
+        try testing.expectEqualStrings("C:\\Users\\u\\.config\\uucli\\config.json", try resolvePath(arena, &env));
+        try env.put("APPDATA", "C:\\Users\\u\\AppData\\Roaming");
+        try testing.expectEqualStrings("C:\\Users\\u\\AppData\\Roaming\\uucli\\config.json", try resolvePath(arena, &env));
+        try env.put("XDG_CONFIG_HOME", "relative");
+        try testing.expectEqualStrings("C:\\Users\\u\\AppData\\Roaming\\uucli\\config.json", try resolvePath(arena, &env));
+        try env.put("XDG_CONFIG_HOME", "C:\\x");
+        try testing.expectEqualStrings("C:\\x\\uucli\\config.json", try resolvePath(arena, &env));
+        try env.put("UUCLI_CONFIG", "C:\\y\\work.json");
+        try testing.expectEqualStrings("C:\\y\\work.json", try resolvePath(arena, &env));
+    } else {
+        try env.put("HOME", "/home/u");
+        try testing.expectEqualStrings("/home/u/.config/uucli/config.json", try resolvePath(arena, &env));
+        try env.put("XDG_CONFIG_HOME", "relative");
+        try testing.expectEqualStrings("/home/u/.config/uucli/config.json", try resolvePath(arena, &env));
+        try env.put("XDG_CONFIG_HOME", "/x");
+        try testing.expectEqualStrings("/x/uucli/config.json", try resolvePath(arena, &env));
+        try env.put("UUCLI_CONFIG", "/y/work.json");
+        try testing.expectEqualStrings("/y/work.json", try resolvePath(arena, &env));
+    }
 }
 
 test "lockPath" {
@@ -335,18 +366,22 @@ test "save then load round-trips with 0600 and rejects group-readable files" {
     try testing.expectEqual(Config{}, try load(arena, io, path));
     const cfg: Config = .{ .client_id = "c", .device_id = "d", .token = "t\"x", .account_name = "名字" };
     try save(io, path, cfg);
-    const st = try Io.Dir.cwd().statFile(io, path, .{});
-    try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
-    const dir_st = try Io.Dir.cwd().statFile(io, std.fs.path.dirname(path).?, .{});
-    try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir_st.permissions.toMode() & 0o777);
+    if (!is_windows) {
+        const st = try Io.Dir.cwd().statFile(io, path, .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+        const dir_st = try Io.Dir.cwd().statFile(io, std.fs.path.dirname(path).?, .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir_st.permissions.toMode() & 0o777);
+    }
 
     const back = try load(arena, io, path);
     try testing.expectEqualStrings("t\"x", back.token);
     try testing.expectEqualStrings("名字", back.account_name);
     try testing.expectEqualStrings("", back.sign_key);
 
-    try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o644), .{});
-    try testing.expectError(error.InsecurePermissions, load(arena, io, path));
+    if (!is_windows) {
+        try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o644), .{});
+        try testing.expectError(error.InsecurePermissions, load(arena, io, path));
+    }
 }
 
 test "assistance codes are saved per share id and omitted when empty" {
@@ -404,15 +439,17 @@ test "saved assistance codes are encrypted on disk with a private key" {
     const key_path = try std.fmt.allocPrint(arena, "{s}.key", .{path});
     const st = try Io.Dir.cwd().statFile(io, key_path, .{});
     try testing.expectEqual(@as(u64, Cipher.key_length), st.size);
-    try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    if (!is_windows) try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
     const back = try load(arena, io, path);
     try testing.expectEqualStrings("private-test-code", back.assistCode("share-test").?);
     try save(io, path, back);
     const second = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096));
     try testing.expect(!std.mem.eql(u8, first, second));
-    try Io.Dir.cwd().setFilePermissions(io, key_path, .fromMode(0o644), .{});
-    try testing.expectError(error.InvalidEncryptionKey, load(arena, io, path));
-    try Io.Dir.cwd().setFilePermissions(io, key_path, .fromMode(0o600), .{});
+    if (!is_windows) {
+        try Io.Dir.cwd().setFilePermissions(io, key_path, .fromMode(0o644), .{});
+        try testing.expectError(error.InvalidEncryptionKey, load(arena, io, path));
+        try Io.Dir.cwd().setFilePermissions(io, key_path, .fromMode(0o600), .{});
+    }
     try Io.Dir.cwd().deleteFile(io, key_path);
     try testing.expectError(error.InvalidEncryptionKey, load(arena, io, path));
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, key_path, .{}));
@@ -453,7 +490,7 @@ test "plaintext saved codes are rejected and can be dropped, keeping encrypted o
     {
         var legacy = stored;
         legacy.assist_codes = mixed;
-        const file = try Io.Dir.cwd().createFile(io, path, .{ .permissions = .fromMode(0o600) });
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .permissions = private_file_perms });
         defer file.close(io);
         var buf: [256]u8 = undefined;
         var w = file.writerStreaming(io, &buf);
