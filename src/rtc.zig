@@ -89,9 +89,16 @@ var hub_ready = false;
 /// that run several sessions). Not thread-safe; call from main first.
 pub fn globalHub(io: Io) *Hub {
     if (builtin.os.tag == .windows) uucli_mbedtls_init_threading();
-    if (!hub_ready or hub_storage.closing.load(.seq_cst)) {
+    if (!hub_ready) {
         hub_storage = .{ .io = io, .queue = .init(&hub_buffer) };
         hub_ready = true;
+    } else if (hub_storage.closing.load(.seq_cst)) {
+        // Late callbacks of closed peers may be inside `push`: keep their `active` count and
+        // reopen only after they left. Until `closing` clears, they touch neither `io` nor the queue.
+        while (hub_storage.active.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+        hub_storage.io = io;
+        hub_storage.queue = .init(&hub_buffer);
+        hub_storage.closing.store(false, .seq_cst);
     }
     return &hub_storage;
 }
@@ -275,6 +282,25 @@ pub fn loopback(io: Io) !void {
             .data_channel, .closed, .@"error" => {},
         }
     }
+}
+
+fn leavePush(io: Io, h: *Hub) void {
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    _ = h.active.fetchSub(1, .seq_cst);
+}
+
+test "reopening the hub waits for a late callback still inside push" {
+    const io = std.testing.io;
+    const h = globalHub(io);
+    h.shutdown();
+    // A callback of a closed peer has entered `push` and leaves only after the reopening began.
+    _ = h.active.fetchAdd(1, .seq_cst);
+    var task = try io.concurrent(leavePush, .{ io, h });
+    const reopened = globalHub(io);
+    task.await(io);
+    try std.testing.expectEqual(@as(u32, 0), reopened.active.load(.seq_cst));
+    try std.testing.expect(!reopened.closing.load(.seq_cst));
+    reopened.shutdown();
 }
 
 test "text messages keep their NUL bytes" {
