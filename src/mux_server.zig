@@ -8,6 +8,7 @@ const api = @import("api.zig");
 const session = @import("session.zig");
 const interrupts = @import("interrupts.zig");
 const mux = @import("mux.zig");
+const mux_client = @import("mux_client.zig");
 const lease = @import("lease.zig");
 const portmap = @import("tools/portmap.zig");
 const log = std.log.scoped(.uucli);
@@ -96,6 +97,7 @@ pub fn run(app: *App, all_args: []const [:0]const u8) !Exit {
     };
     pm.management_hook = control.hook();
 
+    if (try mux_client.insecureMuxDir(app, sock)) |code| return code;
     const cwd = Io.Dir.cwd();
     cwd.deleteFile(io, sock) catch |err| switch (err) {
         error.FileNotFound => {},

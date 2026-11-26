@@ -24,6 +24,18 @@ pub fn muxEnabled(app: *App) bool {
     return true;
 }
 
+/// The exit code when the directory of `sock` is reachable by group or other (spec §7.2).
+pub fn insecureMuxDir(app: *App, sock: []const u8) !?Exit {
+    mux.checkDir(app.io, sock) catch |err| switch (err) {
+        error.InsecureMuxDir => {
+            const dir = std.fs.path.dirname(sock) orelse ".";
+            return app.fail(.other, "{s} is accessible by group/other; fix with: chmod 700 {s}", .{ dir, dir });
+        },
+        else => |e| return e,
+    };
+    return null;
+}
+
 /// `proxy` through the shared session of DEVICE, starting it when needed. Null: not possible here
 /// (socket path too long), connect directly instead.
 pub fn proxyViaMux(app: *App, dev: DeviceArg, assist_code: ?[]const u8, host: []const u8, port: u16) !?Exit {
@@ -34,6 +46,7 @@ pub fn proxyViaMux(app: *App, dev: DeviceArg, assist_code: ?[]const u8, host: []
         log.info("config path too long for a shared session; connecting directly", .{});
         return null;
     };
+    if (try insecureMuxDir(app, sock)) |code| return code;
     // A server can go away between connect and reply (idle exit, session lost): start a new one.
     for (0..3) |_| switch (try muxOpen(app.io, sock, host, port)) {
         .conn => |conn| {
@@ -210,6 +223,7 @@ pub fn portmapViaMux(app: *App, dev: DeviceArg, code: ?[]const u8, pm: *portmap.
         log.info("config path too long for a shared session; connecting directly", .{});
         return null;
     };
+    if (try insecureMuxDir(app, sock)) |c| return c;
     var ctx: MuxForwards = .{ .app = app, .cfg_path = cfg_path, .dev = dev, .code = code, .sock = sock };
     var bus_buf: [16]session.Event = undefined;
     var bus: session.Bus = undefined;
@@ -302,6 +316,7 @@ pub fn startMuxServer(app: *App, cfg_path: []const u8, dev: DeviceArg, sock: []c
     const cwd = Io.Dir.cwd();
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     _ = try cwd.createDirPathStatus(io, try mux.dir(&dir_buf, cfg_path), .fromMode(0o700));
+    if (try insecureMuxDir(app, sock)) |exit| return exit;
     var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const lock = try cwd.createFile(io, try mux.path(&lock_buf, cfg_path, dev.assist, dev.query, .lock), .{
         .truncate = false,

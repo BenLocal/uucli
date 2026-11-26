@@ -596,7 +596,10 @@ process (internal command; not a stable interface).
   resolved device / share ID. Names and IDs for the same target share one connection; favorites
   and explicit `--assist` requests for the same share ID also share one connection. Different
   config paths and connection modes get separate sessions. Target resolution precedes the
-  socket lookup for proxy, portmap and tool leases.
+  socket lookup for proxy, portmap and tool leases. Whoever can connect to a socket gets remote
+  shells and the host's network, so `proxy`, `portmap`, tool leases and `__mux` refuse (exit 1,
+  with a `chmod 700` hint) when `CONFIG_DIR/mux/` exists and is not a directory or is accessible
+  by group or other; an existing directory is never chmod-ed silently.
 - `proxy` connects to `HASH.sock`. If that fails it takes an exclusive `flock` on `HASH.lock`,
   tries again (another `proxy` may have started a server meanwhile), removes a stale socket file,
   and starts `__mux` with its own process group (an ssh client killing the ProxyCommand's group

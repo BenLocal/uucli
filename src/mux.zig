@@ -2,6 +2,7 @@
 //! Shared connections (spec §7.2–§7.4): socket paths, management requests and idle expiry.
 //! The serving side is `PortMap.startMuxAccepting`; startup and serving live in mux_client/server.zig.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const portmap = @import("tools/portmap.zig");
 const lease = @import("lease.zig");
@@ -27,6 +28,17 @@ pub fn path(buf: []u8, config_path: []const u8, assist: bool, device: []const u8
 
 pub fn dir(buf: []u8, config_path: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/mux", .{std.fs.path.dirname(config_path) orelse "."});
+}
+
+/// Refuses a directory of `sock` that group or other can reach: anyone who can connect to a socket
+/// gets remote shells and the host's network. A missing directory is fine (created 0700 later).
+pub fn checkDir(io: Io, sock: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+    const st = Io.Dir.cwd().statFile(io, std.fs.path.dirname(sock) orelse ".", .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    if (st.kind != .directory or st.permissions.toMode() & 0o077 != 0) return error.InsecureMuxDir;
 }
 
 pub const Reply = enum { ok, rejected, timeout, failed };
@@ -57,6 +69,23 @@ test "mux file names depend on config, assist and device" {
     const long = "/" ++ @as([90]u8, @splat('d')) ++ "/config.json";
     try testing.expectError(error.NameTooLong, path(&a, long, false, "gqg", .sock));
     _ = try path(&a, long, false, "gqg", .lock);
+}
+
+test "mux directory must be private" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&sock_buf, "{s}/mux/0123456789abcdef.sock", .{base});
+    try checkDir(io, sock);
+    try tmp.dir.createDir(io, "mux", .fromMode(0o700));
+    try tmp.dir.setFilePermissions(io, "mux", .fromMode(0o700), .{});
+    try checkDir(io, sock);
+    try tmp.dir.setFilePermissions(io, "mux", .fromMode(0o755), .{});
+    try testing.expectError(error.InsecureMuxDir, checkDir(io, sock));
 }
 
 test "mux replies" {

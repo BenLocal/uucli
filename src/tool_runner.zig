@@ -186,6 +186,7 @@ fn runLeased(
         log.info("config path too long for a shared session; connecting directly", .{});
         return null;
     };
+    if (try mux_client.insecureMuxDir(app, sock)) |exit| return exit;
     var granted: ?MuxLease = null;
     var join_code: ?[]const u8 = null;
     for (0..3) |_| {
