@@ -159,7 +159,7 @@ pub fn updateSavedCode(app: *App, id: []const u8, code: ?[]const u8) !void {
     const path = try app.configPath();
     const l = try config.lock(app.io, path, .identity);
     defer l.release(app.io);
-    var cfg = try app.loadConfig(path);
+    var cfg = try app.loadConfig(path, true);
     try cfg.setAssistCode(app.arena, id, code);
     try config.save(app.io, path, cfg);
 }

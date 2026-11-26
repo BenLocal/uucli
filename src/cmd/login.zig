@@ -29,7 +29,7 @@ pub fn run(app: *App, args: []const [:0]const u8) !Exit {
         error.LoginBusy => return app.fail(.other, "another `uucli login` is running for {s}", .{path}),
         error.LoginFailed => return app.fail(.other, "login failed", .{}),
         error.InsecurePermissions, error.InvalidConfig => {
-            _ = app.loadConfig(path) catch {};
+            _ = app.loadConfig(path, false) catch {};
             return .other;
         },
         // Already reported by the login flow.

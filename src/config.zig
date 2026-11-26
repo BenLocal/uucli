@@ -100,8 +100,11 @@ pub fn load(arena: Allocator, io: Io, path: []const u8) !Config {
 }
 
 /// Removes saved codes that are not in the encrypted format (plaintext from older versions) and
-/// rewrites the config; encrypted codes are kept. Returns how many were removed.
-pub fn dropUnsupportedCodes(arena: Allocator, io: Io, path: []const u8) !usize {
+/// rewrites the config; encrypted codes are kept. Returns how many were removed. Takes the
+/// identity lock unless the caller holds it (`flock` would block on a second descriptor).
+pub fn dropUnsupportedCodes(arena: Allocator, io: Io, path: []const u8, lock_held: bool) !usize {
+    const l: ?Lock = if (lock_held) null else try lock(io, path, .identity);
+    defer if (l) |x| x.release(io);
     var cfg = try loadStored(arena, io, path);
     var kept: std.ArrayList(Config.AssistCode) = .empty;
     for (cfg.assist_codes) |entry| if (std.mem.startsWith(u8, entry.code, code_prefix))
@@ -498,12 +501,18 @@ test "plaintext saved codes are rejected and can be dropped, keeping encrypted o
         try w.interface.flush();
     }
     try testing.expectError(error.UnsupportedCodeFormat, load(arena, io, path));
-    try testing.expectEqual(@as(usize, 1), try dropUnsupportedCodes(arena, io, path));
+    try testing.expectEqual(@as(usize, 1), try dropUnsupportedCodes(arena, io, path, false));
+    // It took the identity lock beside the config.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try Io.Dir.cwd().statFile(io, try lockPath(&lock_buf, path, .identity), .{});
     const back = try load(arena, io, path);
     try testing.expectEqualStrings("test-device", back.device_id);
     try testing.expectEqualStrings("new-test-code", back.assistCode("share-new").?);
     try testing.expect(back.assistCode("share-old") == null);
-    try testing.expectEqual(@as(usize, 0), try dropUnsupportedCodes(arena, io, path));
+    // A caller that holds the lock does not deadlock on it.
+    const held = try lock(io, path, .identity);
+    defer held.release(io);
+    try testing.expectEqual(@as(usize, 0), try dropUnsupportedCodes(arena, io, path, true));
 }
 
 test "configs without assistance codes need no encryption key" {

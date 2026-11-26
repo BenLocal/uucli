@@ -10,7 +10,7 @@ pub fn run(app: *App, args: []const [:0]const u8) !Exit {
     const path = try app.configPath();
     const l = try config.lock(app.io, path, .identity);
     defer l.release(app.io);
-    var cfg = try app.loadConfig(path);
+    var cfg = try app.loadConfig(path, true);
     if (!cfg.signedIn() and cfg.token.len == 0) {
         try app.err.writeAll("Not signed in\n");
         return .ok;

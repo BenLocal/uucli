@@ -69,13 +69,14 @@ pub const App = struct {
         return std.ascii.eqlIgnoreCase(a, "y") or std.ascii.eqlIgnoreCase(a, "yes");
     }
 
-    /// Loads the config and maps load errors to messages.
-    pub fn loadConfig(app: *App, path: []const u8) !config.Config {
+    /// Loads the config and maps load errors to messages. `lock_held`: the caller holds the
+    /// identity lock (needed when old saved codes are dropped).
+    pub fn loadConfig(app: *App, path: []const u8, lock_held: bool) !config.Config {
         return config.load(app.arena, app.io, path) catch |err| {
             if (err == error.UnsupportedCodeFormat and app.confirmDropCodes(path)) {
-                if (config.dropUnsupportedCodes(app.arena, app.io, path)) |n| {
+                if (config.dropUnsupportedCodes(app.arena, app.io, path, lock_held)) |n| {
                     try app.err.print("Removed {d} saved remote code(s); enter them again when asked\n", .{n});
-                    return app.loadConfig(path);
+                    return app.loadConfig(path, lock_held);
                 } else |e| {
                     _ = app.fail(.other, "cannot remove the saved remote codes from {s}: {t}", .{ path, e });
                     return error.Reported;
@@ -128,7 +129,7 @@ pub fn errorExit(app: *App, err: anyerror) Exit {
 /// A signed-in API client; reports "not signed in" itself.
 pub fn signedInClient(app: *App, client: *api.Client, cfg: *config.Config) !void {
     const path = try app.configPath();
-    cfg.* = try app.loadConfig(path);
+    cfg.* = try app.loadConfig(path, false);
     if (!cfg.signedIn() or cfg.device_id.len == 0) {
         _ = app.fail(.not_signed_in, "Not signed in: run `uucli login`", .{});
         return error.ReportedNotSignedIn;

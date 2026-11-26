@@ -142,7 +142,7 @@ Host office-pc
 | Path | `$UUCLI_CONFIG`, else `$XDG_CONFIG_HOME/uucli/config.json`, else `%APPDATA%/uucli/config.json` or `%USERPROFILE%/.config/uucli/config.json` on Windows, else `~/.config/uucli/config.json` (macOS too) |
 | Permissions | file `0600`, directory `0700` on Linux/macOS; uucli refuses to read a config readable by group/other and says how to fix it (skipped on Windows) |
 | Writes | write `config.json.tmp` (0600) → fsync → rename |
-| Locking | Lock files are named after the config file's stem (`config.json` → `config.lock`, `config.login.lock`). Blocking `flock` on `STEM.lock` around device registration and login (and `logout`, and saving codes in `fav add` / `fav rm`), so two processes cannot register two devices |
+| Locking | Lock files are named after the config file's stem (`config.json` → `config.lock`, `config.login.lock`). Blocking `flock` on `STEM.lock` around device registration and login (and `logout`, saving codes in `fav add` / `fav rm`, and dropping saved codes of an older format), so every config write holds it and two processes cannot register two devices |
 
 ```json
 {
