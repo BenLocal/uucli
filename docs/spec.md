@@ -969,8 +969,8 @@ counter starting at 100. Result codes: 1 = success, anything else → exit 6 wit
 - GitHub Actions: `ci.yml` (every push and pull request) runs `zig fmt --check`, the SPDX header
   check, build + unit/e2e tests + CLI smoke checks on Ubuntu, macOS, and Windows, and
   `aarch64-linux-musl` / `x86_64-windows-gnu` cross-builds. `release.yml`
-  runs for a pushed tag `vVERSION` that equals `build.zig`'s version: Linux archives on Ubuntu, macOS
-  archives on a macOS runner (best effort: a failure does not hold back the Linux release), then a
+  runs for a pushed tag `vVERSION` that equals `build.zig`'s version: Linux and Windows archives on Ubuntu, macOS
+  archives on a macOS runner (best effort: a failure does not hold back the Linux/Windows release), then a
   GitHub release with the archives and `SHA256SUMS`.
 - `contrib/systemd/uucli-portmap@.service`: user unit; instance `NAME` reads
   `~/.config/uucli/portmap-NAME.env` (`UUCLI_DEVICE`, `UUCLI_FORWARDS`), restarts on failure after

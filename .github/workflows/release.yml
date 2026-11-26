@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Release archives (spec §11.3) for a pushed tag vVERSION. Linux is built on Linux; the macOS
-# targets need the SDK, so they are built on a macOS runner and do not block a Linux release.
+# Release archives (spec §11.3) for a pushed tag vVERSION. Linux and Windows are built on Linux;
+# the macOS targets need the SDK, so they are built on a macOS runner and do not block a release.
 name: Release
 
 on:
@@ -54,10 +54,25 @@ jobs:
           path: zig-out/release/*.tar.gz
           if-no-files-found: error
 
+  windows:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig build release -Drelease-os=windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: zig-out/release/*.tar.gz
+          if-no-files-found: error
+
   publish:
-    needs: [linux, macos]
-    # macOS is best effort: publish whenever the Linux archives exist.
-    if: ${{ !cancelled() && needs.linux.result == 'success' }}
+    needs: [linux, macos, windows]
+    # macOS is best effort: publish whenever the Linux and Windows archives exist.
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
