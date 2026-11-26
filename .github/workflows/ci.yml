@@ -79,6 +79,9 @@ jobs:
         shell: pwsh
         run: |
           .\zig-out\bin\uucli.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "expected exit 0 for --version, got $LASTEXITCODE" }
           .\zig-out\bin\uucli.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "expected exit 0 for --help, got $LASTEXITCODE" }
           .\zig-out\bin\uucli.exe session list
           if ($LASTEXITCODE -ne 1) { throw "expected exit 1 for session list on Windows, got $LASTEXITCODE" }
+          exit 0
